@@ -607,12 +607,16 @@ If this is a writing or creative discussion, include sections for characters, pl
 
 		// Re-upload files using addFile() which handles all file types
 		const failedFiles = [];
-		for (const f of dedupedFiles) {
+		for (let i = 0; i < dedupedFiles.length; i++) {
+			const f = dedupedFiles[i];
 			let uploaded = false;
 			while (!uploaded) {
 				try {
 					await forkMessage.addFile(f);
 					uploaded = true;
+					if (i < dedupedFiles.length - 1) {
+						await new Promise(r => setTimeout(r, 200));
+					}
 				} catch (error) {
 					console.log(`Failed to transfer file ${f.file_name}:`, error);
 					const choice = await showClaudeThreeOption(

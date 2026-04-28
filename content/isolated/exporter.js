@@ -382,17 +382,23 @@
 				}
 			}
 
-			// Download all files for this message in parallel
-			const fileResults = await Promise.all(message.files.map(async (file) => {
+			// Download files sequentially with delay to avoid rate limiting
+			const fileResults = [];
+			for (let fi = 0; fi < message.files.length; fi++) {
+				const file = message.files[fi];
 				if (file instanceof ClaudeAttachment) {
 					const b64 = btoa(unescape(encodeURIComponent(file.extracted_content || '')));
 					const mimeType = mime.getType(file.file_name) || 'text/plain';
-					return `<a class="file-pill" href="data:${mimeType};base64,${b64}" download="${esc(file.file_name)}">File: ${esc(file.file_name)}</a>`;
+					fileResults.push(`<a class="file-pill" href="data:${mimeType};base64,${b64}" download="${esc(file.file_name)}">File: ${esc(file.file_name)}</a>`);
+					continue;
 				}
 
 				try {
 					const blob = await file.download();
-					if (!blob) return `<span class="file-pill">File: ${esc(file.file_name)}</span>`;
+					if (!blob) {
+						fileResults.push(`<span class="file-pill">File: ${esc(file.file_name)}</span>`);
+						continue;
+					}
 
 					const dataUri = await new Promise(resolve => {
 						const reader = new FileReader();
@@ -401,13 +407,17 @@
 					});
 
 					if (file.file_kind === 'image') {
-						return `<img src="${dataUri}" alt="${esc(file.file_name)}">`;
+						fileResults.push(`<img src="${dataUri}" alt="${esc(file.file_name)}">`);
+					} else {
+						fileResults.push(`<a class="file-pill" href="${dataUri}" download="${esc(file.file_name)}">File: ${esc(file.file_name)}</a>`);
 					}
-					return `<a class="file-pill" href="${dataUri}" download="${esc(file.file_name)}">File: ${esc(file.file_name)}</a>`;
+					if (fi < message.files.length - 1) {
+						await new Promise(r => setTimeout(r, 200));
+					}
 				} catch (e) {
-					return `<span class="file-pill">File: ${esc(file.file_name)}</span>`;
+					fileResults.push(`<span class="file-pill">File: ${esc(file.file_name)}</span>`);
 				}
-			}));
+			}
 
 			contentHtml += fileResults.join('');
 			messagesHtml += `<div class="msg ${roleClass}" id="msg-${message.uuid}" style="display:none"><div class="msg-header">${role}</div><div class="msg-body">${contentHtml}</div></div>\n`;
@@ -491,6 +501,9 @@
 					name: `files/${buildZipFilename(file.file_uuid, file.file_name)}`,
 					data: base64
 				});
+				if (i < allFiles.length - 1) {
+					await new Promise(r => setTimeout(r, 200));
+				}
 			} catch (error) {
 				console.log(`Failed to download ${file.file_name}:`, error);
 			}
@@ -1345,7 +1358,7 @@
 		const conversation = new ClaudeConversation(orgId, conversationId);
 		const conversationData = await conversation.getData();
 		const wasCached = conversation.lastGetDataFromCache;
-		const messages = await conversation.getMessages(format === 'html' || format === 'zip' || exportTree);
+		const messages = await conversation.getMessages(exportTree);
 		const safeName = (conversationData.name || 'untitled').replace(/[<>:"/\\|?*]/g, '_');
 		const filename = `Claude_export_${safeName}_${conversationId}.${extension}`;
 		const exportContent = await formatExport(conversationData, messages, format, conversationId, loadingModal, exportOptions);
@@ -1580,7 +1593,8 @@
 			treeOption.id = 'treeOption';
 			treeOption.className = 'mb-4 hidden';
 
-			const { container: toggleContainer, input: treeToggleInput } = createClaudeToggle('Export entire tree', false);
+			const initialTreeDefault = ['html', 'zip'].includes(lastFormat.split('_')[0]);
+			const { container: toggleContainer, input: treeToggleInput } = createClaudeToggle('Export entire tree', initialTreeDefault);
 			toggleInput = treeToggleInput;
 			treeOption.appendChild(toggleContainer);
 			content.appendChild(treeOption);
@@ -1610,14 +1624,15 @@
 
 			// Show/hide options based on initial value
 			const initialFormat = lastFormat.split('_')[0];
-			treeOption.classList.toggle('hidden', !['librechat', 'raw'].includes(initialFormat));
+			treeOption.classList.toggle('hidden', !['librechat', 'raw', 'html', 'zip'].includes(initialFormat));
 			thinkingOption.classList.toggle('hidden', initialFormat !== 'md');
 
 			// Update option visibility on select change
 			formatSelect.onchange = () => {
 				const format = formatSelect.value.split('_')[0];
-				treeOption.classList.toggle('hidden', !['librechat', 'raw'].includes(format));
+				treeOption.classList.toggle('hidden', !['librechat', 'raw', 'html', 'zip'].includes(format));
 				thinkingOption.classList.toggle('hidden', format !== 'md');
+				toggleInput.checked = ['html', 'zip'].includes(format);
 			};
 
 			// Export button handler
