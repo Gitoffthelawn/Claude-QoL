@@ -1494,6 +1494,10 @@ const MessageButtonBar = {
 			}
 		}
 
+		while (insertBefore && insertBefore.parentElement !== container) {
+			insertBefore = insertBefore.parentElement;
+		}
+
 		if (insertBefore) {
 			container.insertBefore(button, insertBefore);
 		} else {
