@@ -9,14 +9,6 @@
 // Each entry: { key: 'storage_key', default: defaultValue, type: 'boolean'|'string'|'object' }
 
 const SETTINGS_KEYS = {
-	STT: {
-		ENABLED: { key: 'stt_enabled', default: false, type: 'boolean' },
-		PROVIDER: { key: 'stt_provider', default: 'groq', type: 'string' },
-		API_KEY: { key: 'stt_api_key', default: '', type: 'string' },
-		AUTO_SEND: { key: 'stt_auto_send', default: false, type: 'boolean' },
-		AUDIO_DEVICE: { key: 'stt_audio_device', default: 'default', type: 'string' },
-		BASE_URL: { key: 'openai_stt_base_url', default: '', type: 'string' },
-	},
 	TTS: {
 		ENABLED: { key: 'tts_enabled', default: false, type: 'boolean' },
 		PROVIDER: { key: 'tts_provider', default: 'elevenlabs', type: 'string' },

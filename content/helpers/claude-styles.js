@@ -1085,7 +1085,6 @@ const ButtonBar = {
 		'style-selector-button',
 		'preset-switcher-button',
 		'export-button',
-		'stt-settings-button',
 		'tts-settings-button',
 	],
 
