@@ -30,23 +30,28 @@
 	}
 
 	function findContentArea(actionBar) {
-		const container = actionBar.parentElement;
-		if (!container) return null;
-
-		for (const child of container.children) {
-			if (child === actionBar) continue;
-			if (child.textContent?.trim().length > 20) return child;
+		let container = actionBar.parentElement;
+		for (let i = 0; i < 8 && container; i++) {
+			const actionBarText = actionBar.textContent?.trim() || '';
+			const containerText = container.textContent?.trim() || '';
+			if (containerText.length > actionBarText.length + 50) {
+				for (const child of container.children) {
+					if (child === actionBar || child.contains(actionBar)) continue;
+					if (child.textContent?.trim().length > 20) return child;
+				}
+			}
+			container = container.parentElement;
 		}
 		return null;
 	}
 
 	function cleanHtmlForClipboard(contentEl) {
 		const clone = contentEl.cloneNode(true);
-		clone.querySelectorAll('button, svg, [role="button"]').forEach(el => el.remove());
+		clone.querySelectorAll('button, svg, [role="button"], .' + RICH_COPY_CLASS).forEach(el => el.remove());
 		return clone.innerHTML;
 	}
 
-	async function copyAsRichText(actionBar, button) {
+	function copyAsRichText(actionBar, button) {
 		const contentEl = findContentArea(actionBar);
 		if (!contentEl) {
 			showClaudeAlert('Error', 'Could not find content to copy.');
@@ -61,19 +66,21 @@
 			return;
 		}
 
-		try {
-			await navigator.clipboard.write([
-				new ClipboardItem({
-					'text/html': new Blob([html], { type: 'text/html' }),
-					'text/plain': new Blob([plainText], { type: 'text/plain' }),
-				})
-			]);
+		const listener = (e) => {
+			e.clipboardData.setData('text/html', html);
+			e.clipboardData.setData('text/plain', plainText);
+			e.preventDefault();
+		};
 
+		document.addEventListener('copy', listener);
+		const success = document.execCommand('copy');
+		document.removeEventListener('copy', listener);
+
+		if (success) {
 			const original = button.innerHTML;
 			button.innerHTML = CHECK_SVG;
 			setTimeout(() => { button.innerHTML = original; }, 1500);
-		} catch (err) {
-			console.error('[Rich Copy] Clipboard write failed:', err);
+		} else {
 			showClaudeAlert('Error', 'Failed to copy rich text to clipboard.');
 		}
 	}
