@@ -1,3 +1,2 @@
-Remove STT as it's now built in
-Fix global search for very large exports
-Add active flags indicator
+Add timestamp/model slug in HTML/MD exports
+Store active flags in storage until expiry so they don't disappear early
