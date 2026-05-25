@@ -37,7 +37,8 @@
 				"content/isolated/perchat-styles.js",
 				"content/isolated/tts.js",
 				"content/isolated/exporter.js",
-				"content/isolated/notifications.js"
+				"content/isolated/notifications.js",
+				"content/isolated/rich-copy.js"
 			],
 			"run_at": "document_idle"
 		},
