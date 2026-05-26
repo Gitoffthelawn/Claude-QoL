@@ -1,6 +1,6 @@
-// rich-copy.js
+// rich-copy.js (ISOLATED world)
 // Adds "Copy as Rich Text" buttons next to copy buttons on Claude's content blocks.
-// Copies rendered HTML to clipboard so it pastes with formatting into email, Docs, etc.
+// Clicks the native copy button, then the main-world interceptor converts markdown to HTML.
 
 (function () {
 	'use strict';
@@ -29,64 +29,49 @@
 		return results;
 	}
 
-	function findContentArea(actionBar) {
-		let current = actionBar;
-		for (let i = 0; i < 4 && current.parentElement; i++) {
-			const parent = current.parentElement;
-			let best = null;
-			for (const child of parent.children) {
-				if (child === current || child.contains(current)) break;
-				if (child.tagName === 'TEXTAREA' || child.tagName === 'INPUT') continue;
-				if (child.querySelector('textarea, input[type="text"]')) continue;
-				if (child.textContent?.trim().length > 20) best = child;
-			}
-			if (best) return best;
-			current = parent;
-		}
-		return null;
-	}
+	async function copyAsRichText(nativeCopyBtn, richBtn) {
+		window.postMessage({ type: 'rich-copy-activate' }, '*');
 
-	function cleanHtmlForClipboard(contentEl) {
-		const clone = contentEl.cloneNode(true);
-		clone.querySelectorAll('button, svg, [role="button"], .' + RICH_COPY_CLASS).forEach(el => el.remove());
-		return clone.innerHTML;
-	}
+		await new Promise((resolve) => {
+			const listener = (event) => {
+				if (event.data.type === 'rich-copy-ready') {
+					window.removeEventListener('message', listener);
+					resolve();
+				}
+			};
+			window.addEventListener('message', listener);
+			setTimeout(() => {
+				window.removeEventListener('message', listener);
+				resolve();
+			}, 100);
+		});
 
-	function copyAsRichText(actionBar, button) {
-		const contentEl = findContentArea(actionBar);
-		if (!contentEl) {
-			showClaudeAlert('Error', 'Could not find content to copy.');
-			return;
-		}
+		nativeCopyBtn.click();
 
-		const html = cleanHtmlForClipboard(contentEl);
-		const plainText = contentEl.textContent?.trim() || '';
+		const result = await new Promise((resolve) => {
+			const listener = (event) => {
+				if (event.data.type === 'rich-copy-done' || event.data.type === 'rich-copy-error') {
+					window.removeEventListener('message', listener);
+					resolve(event.data);
+				}
+			};
+			window.addEventListener('message', listener);
+			setTimeout(() => {
+				window.removeEventListener('message', listener);
+				resolve({ type: 'rich-copy-error', error: 'Timeout' });
+			}, 2000);
+		});
 
-		if (!plainText) {
-			showClaudeAlert('Error', 'No content to copy.');
-			return;
-		}
-
-		const listener = (e) => {
-			e.clipboardData.setData('text/html', html);
-			e.clipboardData.setData('text/plain', plainText);
-			e.preventDefault();
-		};
-
-		document.addEventListener('copy', listener);
-		const success = document.execCommand('copy');
-		document.removeEventListener('copy', listener);
-
-		if (success) {
-			const original = button.innerHTML;
-			button.innerHTML = CHECK_SVG;
-			setTimeout(() => { button.innerHTML = original; }, 1500);
+		if (result.type === 'rich-copy-done') {
+			const original = richBtn.innerHTML;
+			richBtn.innerHTML = CHECK_SVG;
+			setTimeout(() => { richBtn.innerHTML = original; }, 1500);
 		} else {
-			showClaudeAlert('Error', 'Failed to copy rich text to clipboard.');
+			showClaudeAlert('Error', 'Failed to copy rich text: ' + (result.error || 'Unknown error'));
 		}
 	}
 
-	function createRichCopyButton(actionBar) {
+	function createRichCopyButton(nativeCopyBtn, actionBar) {
 		const copyBtnClasses = `inline-flex items-center justify-center relative isolate shrink-0 can-focus select-none disabled:pointer-events-none disabled:opacity-50 disabled:shadow-none disabled:drop-shadow-none border-transparent transition font-base duration-300 ease-[cubic-bezier(0.165,0.85,0.45,1)] h-8 w-8 rounded-md`;
 
 		const pill = document.createElement('div');
@@ -104,7 +89,7 @@
 		btn.addEventListener('click', (e) => {
 			e.preventDefault();
 			e.stopPropagation();
-			copyAsRichText(actionBar, btn);
+			copyAsRichText(nativeCopyBtn, btn);
 		});
 
 		createClaudeTooltip(btn, 'Copy as rich text');
@@ -123,7 +108,7 @@
 			const copyPill = copyBtn.closest('.bg-bg-000.rounded-lg');
 			if (!copyPill) continue;
 
-			const richBtn = createRichCopyButton(actionBar);
+			const richBtn = createRichCopyButton(copyBtn, actionBar);
 			copyPill.parentElement.insertBefore(richBtn, copyPill.nextSibling);
 		}
 	}
