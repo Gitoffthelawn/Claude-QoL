@@ -1,14 +1,13 @@
 {
 	"manifest_version": 3,
 	"name": "Claude QoL - Export, Fork, Search, and more",
-	"version": "2.6.4",
-	"description": "Collection of claude.ai enhancements: Exporting/Importing chats, Forking, Text Search, Bookmarks, TTS, STT, and more.",
+	"version": "2.6.6",
+	"description": "Collection of Claude enhancements: Exporting/Importing chats, Forking, Text Search, Bookmarks, TTS, and more.",
 	"permissions": [
 		"storage"
 	],
 	"host_permissions": [
 		"https://claude.ai/*",
-		"https://api.groq.com/*",
 		"https://api.elevenlabs.io/*",
 		"https://storage.googleapis.com/*"
 	],
@@ -27,17 +26,16 @@
 				"content/helpers/claude-api.js",
 				"content/helpers/settings.js",
 				"content/helpers/databases.js",
-				"content/helpers/stt-providers.js",
 				"content/helpers/tts-providers.js",
 				"content/isolated/global-search.js",
 				"content/isolated/chat-search.js",
 				"content/isolated/navigation.js",
 				"content/isolated/pref-switcher.js",
-				"content/isolated/stt.js",
 				"content/isolated/perchat-styles.js",
 				"content/isolated/tts.js",
 				"content/isolated/exporter.js",
 				"content/isolated/notifications.js",
+				"content/isolated/banner-watcher.js",
 				"content/isolated/rich-copy.js"
 			],
 			"run_at": "document_idle"
@@ -61,7 +59,9 @@
 				"content/main/styles-fetch-interceptor.js",
 				"content/main/tts-interceptor.js",
 				"content/main/image-extractor.js",
-				"content/main/extra-models.js"
+				"content/main/extra-models.js",
+				"lib/marked.min.js",
+				"content/main/rich-copy-interceptor.js"
 			],
 			"world": "MAIN",
 			"run_at": "document_start"
