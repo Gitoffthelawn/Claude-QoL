@@ -142,7 +142,8 @@
 
 			textarea.focus();
 			textarea.select();
-			document.execCommand('insertText', false, newText);
+			// Always append a space to guarantee the UI detects a change — the fetch interceptor overwrites the text anyway
+			document.execCommand('insertText', false, newText + ' ');
 
 			setTimeout(() => {
 				saveButton.click();
