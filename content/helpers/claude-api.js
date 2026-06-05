@@ -120,6 +120,7 @@ async function bustReactQueryCache() {
 		request.onerror = () => resolve();
 	});
 }
+bustReactQueryCache();
 
 // Shared streaming freshness check.
 // Fetches apiUrl, reads first ~8KB to find updated_at, compares with cachedEntry.
