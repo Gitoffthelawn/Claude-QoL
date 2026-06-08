@@ -53,7 +53,8 @@
 	};
 
 	// ======== ENCRYPTION ========
-	const ENCRYPTION_KEY_PREFIX = 'QOL_ENCRYPT_NODELETE_';
+	const ENCRYPTION_CONNECTOR_NAME = 'QOL_ENCRYPTIONKEY_DO_NOT_DELETE';
+	const ENCRYPTION_KEY_URL_PREFIX = 'https://lugia19.com/qol-encryption-key/';
 	let _encryptionKeyPromise = null;
 	let _keyHash = null; // first 8 hex chars of SHA-256 of the raw key
 
@@ -112,33 +113,31 @@
 	}
 
 	async function _initEncryptionKey() {
-		let stylesData;
+		let connectors;
 		for (let attempt = 0; attempt < 10; attempt++) {
 			try {
-				stylesData = await listStyles(getOrgId());
+				connectors = await listConnectors(getOrgId());
 				break;
 			} catch (e) {
 				if (attempt < 9) {
-					console.warn(`[Encryption] Failed to fetch styles (attempt ${attempt + 1}/10), retrying...`);
+					console.warn(`[Encryption] Failed to fetch connectors (attempt ${attempt + 1}/10), retrying...`);
 					await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
 					continue;
 				}
-				console.warn('[Encryption] Failed to fetch styles after 10 attempts, operating in plaintext mode:', e.message);
+				console.warn('[Encryption] Failed to fetch connectors after 10 attempts, operating in plaintext mode:', e.message);
 				return null;
 			}
 		}
 
-		// Search styles for our key
-		const allStyles = [
-			...(stylesData.defaultStyles || []),
-			...(stylesData.customStyles || [])
-		];
-		const keyStyle = allStyles.find(s => s.name && s.name.startsWith(ENCRYPTION_KEY_PREFIX));
+		const keyConnector = connectors.find(c => c.name === ENCRYPTION_CONNECTOR_NAME);
 
-		if (keyStyle) {
-			const base64Key = keyStyle.name.substring(ENCRYPTION_KEY_PREFIX.length);
-			const rawKey = Uint8Array.from(atob(base64Key), c => c.charCodeAt(0));
+		if (keyConnector) {
+			console.log('[Encryption] Found encryption key connector:', keyConnector.uuid);
+			const base64Key = keyConnector.url.substring(ENCRYPTION_KEY_URL_PREFIX.length);
+			const standardBase64 = base64Key.replace(/-/g, '+').replace(/_/g, '/');
+			const rawKey = Uint8Array.from(atob(standardBase64), c => c.charCodeAt(0));
 			_keyHash = await _computeKeyHash(rawKey);
+			console.log('[Encryption] Key hash:', _keyHash);
 			const key = await crypto.subtle.importKey(
 				'raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']
 			);
@@ -146,33 +145,67 @@
 			return key;
 		}
 
-		// No key in styles — try to create one
+		// No connector found — wipe any existing encrypted data (old key from styles is unrecoverable)
+		console.log('[Encryption] No encryption connector found, wiping existing data...');
+		await _wipeAllEncryptedData();
+
+		// Generate new key
 		const rawKey = crypto.getRandomValues(new Uint8Array(16)); // 128-bit
-		const base64Key = btoa(String.fromCharCode(...rawKey)).replace(/=+$/, '');
+		const base64Key = btoa(String.fromCharCode(...rawKey))
+			.replace(/=+$/, '')
+			.replace(/\+/g, '-')
+			.replace(/\//g, '_');
+		const keyUrl = ENCRYPTION_KEY_URL_PREFIX + base64Key;
+
 		for (let attempt = 0; attempt < 10; attempt++) {
 			try {
-				await createStyle(getOrgId(), 'Encryption key for Claude QoL cache', ENCRYPTION_KEY_PREFIX + base64Key);
+				const connector = await createConnector(getOrgId(), ENCRYPTION_CONNECTOR_NAME, keyUrl);
+				console.log('[Encryption] Created encryption key connector:', connector.uuid);
 				_keyHash = await _computeKeyHash(rawKey);
+				console.log('[Encryption] New key hash:', _keyHash);
 				const key = await crypto.subtle.importKey(
 					'raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']
 				);
-				_bulkEncryptAll(); // fire-and-forget
 				return key;
 			} catch (e) {
 				if (attempt < 9) {
-					console.warn(`[Encryption] Failed to create key style (attempt ${attempt + 1}/10), retrying...`);
+					console.warn(`[Encryption] Failed to create key connector (attempt ${attempt + 1}/10), retrying...`);
 					await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
 					continue;
 				}
-				console.warn('[Encryption] Failed to create key style after 10 attempts, operating in plaintext mode:', e.message);
+				console.warn('[Encryption] Failed to create key connector after 10 attempts, operating in plaintext mode:', e.message);
 				return null;
 			}
+		}
+	}
+
+	async function _wipeAllEncryptedData() {
+		try {
+			const msgCount = await db.messages.count();
+			const metaCount = await db.metadata.count();
+			const cacheCount = await cacheDB.conversations.count();
+			const phantomCount = await phantomDB.phantomMessages.count();
+			console.log(`[Encryption] Wiping: ${msgCount} messages, ${metaCount} metadata, ${cacheCount} cached conversations, ${phantomCount} phantom messages`);
+
+			await Promise.all([
+				db.messages.clear(),
+				db.metadata.clear(),
+				cacheDB.conversations.clear(),
+				phantomDB.phantomMessages.clear()
+			]);
+
+			console.log('[Encryption] Data wipe complete');
+		} catch (e) {
+			console.warn('[Encryption] Error during data wipe:', e.message);
 		}
 	}
 
 	// Expose for use by other scripts
 	window.ClaudeSearchShared.encryptData = encryptData;
 	window.ClaudeSearchShared.decryptData = decryptData;
+
+	// Eagerly initialize encryption key on load
+	getEncryptionKey();
 
 	// ======== INDEXEDDB MANAGEMENT ========
 	const db = new Dexie('ClaudeSearchDB');

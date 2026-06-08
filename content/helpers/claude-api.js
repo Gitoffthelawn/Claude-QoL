@@ -1855,6 +1855,38 @@ function getProjectId() {
 	return match ? match[1] : null;
 }
 
+// ======== Connector API (used for encryption key storage) ========
+
+async function listConnectors(orgId) {
+	const response = await fetch(`/api/organizations/${orgId}/mcp/remote_servers`);
+	if (!response.ok) {
+		throw new Error(`Failed to list connectors: ${response.statusText}`);
+	}
+	return await response.json();
+}
+
+async function createConnector(orgId, name, url) {
+	const response = await fetch(`/api/organizations/${orgId}/mcp/remote_servers`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			name,
+			url,
+			custom_oauth_client_id: 'This fake "connector" just contains the encryption key to keep your Claude QOL data secure.',
+			custom_oauth_client_secret: 'dummy',
+			id_jag_config: null,
+			attestations: []
+		})
+	});
+
+	if (!response.ok) {
+		const error = await response.json();
+		throw new Error(error.message || 'Failed to create connector');
+	}
+
+	return await response.json();
+}
+
 async function isLikelyTextFile(file) {
 	// First check browser-provided MIME type
 	if (file.type && file.type.startsWith('text/')) {
