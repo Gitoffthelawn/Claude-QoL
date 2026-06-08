@@ -25,12 +25,6 @@ const SETTINGS_KEYS = {
 		CHARACTERS: { key: 'tts_chatCharacters', default: {}, type: 'object', oldKeyPrefix: 'chatCharacters_' },
 		QUOTES_ONLY: { key: 'tts_chatQuotesOnly', default: {}, type: 'object', oldKeyPrefix: 'chatQuotesOnly_' },
 	},
-	PERCHAT_STYLES: {
-		STYLES: { key: 'perchat_styles', default: {}, type: 'object', oldKeyPrefix: 'style_' },
-	},
-	PERPROJECT_STYLES: {
-		STYLES: { key: 'perproject_styles', default: {}, type: 'object' },
-	},
 	NAVIGATION: {
 		BOOKMARKS: { key: 'navigation_bookmarks', default: {}, type: 'object' },
 	},

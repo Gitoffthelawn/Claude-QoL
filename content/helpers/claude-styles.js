@@ -1339,7 +1339,6 @@ const ButtonBar = {
 		'banner-watcher-button',
 		'search-button',
 		'navigation-button',
-		'style-selector-button',
 		'preset-switcher-button',
 		'export-button',
 		'tts-settings-button',

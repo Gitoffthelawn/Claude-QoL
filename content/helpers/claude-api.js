@@ -213,14 +213,7 @@ class ClaudeConversation {
 		return this.conversationId;
 	}
 
-	// Send a message and wait for response.
-	// options.applyCurrentStyle (default true): attach the user's current global
-	// style to the send. Set false for throwaway completions (e.g. TTS dialogue
-	// analysis) where the style would just distort the output.
 	async sendMessageAndWaitForResponse(promptOrMessage, options = {}) {
-		const { applyCurrentStyle = true } = options;
-		const currentStyle = applyCurrentStyle ? await getCurrentUserStyle(this.orgId) : null;
-
 		// String path: plain prompts carry no files, no splitting needed.
 		if (!(promptOrMessage instanceof ClaudeMessage)) {
 			const {
@@ -229,7 +222,6 @@ class ClaudeConversation {
 				attachments = [],
 				files = [],
 				syncSources = [],
-				personalizedStyles = null
 			} = options;
 
 			const requestBody = {
@@ -238,7 +230,6 @@ class ClaudeConversation {
 				attachments,
 				files,
 				sync_sources: syncSources,
-				personalized_styles: personalizedStyles ?? (currentStyle ? [currentStyle] : null),
 				rendering_mode: "messages"
 			};
 
@@ -256,9 +247,6 @@ class ClaudeConversation {
 		if (completionFiles.length <= MAX_FILES_PER_MESSAGE) {
 			const requestBody = msg.toCompletionJSON();
 			if (options.model) requestBody.model = options.model;
-			if (currentStyle && (!requestBody.personalized_styles || requestBody.personalized_styles.length === 0)) {
-				requestBody.personalized_styles = [currentStyle];
-			}
 			return this._postCompletionAndAwaitAssistant(requestBody);
 		}
 
@@ -278,7 +266,6 @@ class ClaudeConversation {
 				prompt: `[Forking chat in progress -> Uploading file batch ${i + 1}/${chunks.length} — please reply with "ok" so the next batch can be sent. Context will be in the last batch.]`,
 				parent_message_uuid: parentUuid,
 				timezone: msg.timezone,
-				personalized_styles: currentStyle ? [currentStyle] : [],
 				locale: msg.locale,
 				model: options.model ?? msg.model,
 				tools: msg.tools,
@@ -295,9 +282,6 @@ class ClaudeConversation {
 		finalBody.parent_message_uuid = parentUuid;
 		finalBody.files = lastChunk.map(f => f.file_uuid);
 		if (options.model) finalBody.model = options.model;
-		if (currentStyle && (!finalBody.personalized_styles || finalBody.personalized_styles.length === 0)) {
-			finalBody.personalized_styles = [currentStyle];
-		}
 		return this._postCompletionAndAwaitAssistant(finalBody);
 	}
 
@@ -1173,7 +1157,6 @@ class ClaudeMessage {
 
 		this.model = null;
 		this.tools = [];
-		this.personalized_styles = [];
 		this.rendering_mode = 'messages';
 
 		if (historyJson) {
@@ -1477,7 +1460,6 @@ class ClaudeMessage {
 			prompt: textBlocks[0].text,
 			parent_message_uuid: this.parent_message_uuid,
 			timezone: this.timezone,
-			personalized_styles: this.personalized_styles,
 			locale: this.locale,
 			model: this.model,
 			tools: this.tools,
@@ -1871,93 +1853,6 @@ function getConversationId() {
 function getProjectId() {
 	const match = window.location.pathname.match(/\/project\/([a-f0-9-]+)/);
 	return match ? match[1] : null;
-}
-
-// ======== Style API ========
-
-// Resolves the user's currently-selected global style to the full style object
-// Claude's completion endpoint expects. Returns null if no style is selected or
-// the selected key no longer exists. Swallows errors — callers get null and
-// fall back to no-style behavior.
-async function getCurrentUserStyle(orgId) {
-	try {
-		const raw = localStorage.getItem('LSS-claude_personalized_style');
-		const key = raw ? JSON.parse(raw)?.value?.styleKey : null;
-		if (!key) return null;
-		const { defaultStyles = [], customStyles = [] } = await listStyles(orgId);
-		return [...defaultStyles, ...customStyles].find(s => s.key === key || s.uuid === key) ?? null;
-	} catch (e) {
-		console.warn('getCurrentUserStyle failed:', e);
-		return null;
-	}
-}
-
-async function getEffectiveStyle(orgId, conversationId) {
-	const overrideStyle = await new Promise((resolve) => {
-		const requestId = Math.random().toString(36).substr(2, 9);
-		const listener = (event) => {
-			if (event.data.type === 'perchat-style-response' && event.data.requestId === requestId) {
-				window.removeEventListener('message', listener);
-				resolve(event.data.style);
-			}
-		};
-		window.addEventListener('message', listener);
-		window.postMessage({ type: 'perchat-style-request', conversationId, requestId }, '*');
-		setTimeout(() => { window.removeEventListener('message', listener); resolve(null); }, 500);
-	});
-
-	if (overrideStyle?.type === 'none') return null;
-	if (overrideStyle) return overrideStyle;
-	return getCurrentUserStyle(orgId);
-}
-
-async function listStyles(orgId) {
-	const response = await fetch(`/api/organizations/${orgId}/list_styles`);
-	if (!response.ok) {
-		throw new Error(`Failed to list styles: ${response.statusText}`);
-	}
-	return await response.json();
-}
-
-async function createStyle(orgId, prompt, name) {
-	const createResponse = await fetch(`/api/organizations/${orgId}/styles/create`, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ prompt })
-	});
-
-	if (!createResponse.ok) {
-		const error = await createResponse.json();
-		throw new Error(error.message || 'Failed to create style');
-	}
-
-	const style = await createResponse.json();
-
-	if (name) {
-		return await updateStyle(orgId, style.uuid, prompt, name);
-	}
-
-	return style;
-}
-
-async function updateStyle(orgId, styleId, prompt, name) {
-	const body = { prompt };
-	if (name) body.name = name;
-
-	const response = await fetch(`/api/organizations/${orgId}/styles/${styleId}/edit`, {
-		method: 'PUT',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body)
-	});
-
-	if (!response.ok) {
-		const error = await response.json();
-		const err = new Error(error.message || 'Failed to update style');
-		err.status = response.status;
-		throw err;
-	}
-
-	return await response.json();
 }
 
 async function isLikelyTextFile(file) {

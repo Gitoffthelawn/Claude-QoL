@@ -128,12 +128,6 @@ If this is a writing or creative discussion, include sections for characters, pl
 		includeToolCallsContainer.appendChild(keepToolCallsFromSummarizedToggle.container);
 		leftPanel.appendChild(includeToolCallsContainer);
 
-		// Use current style for summarization toggle
-		const useCurrentStyleToggle = createClaudeToggle('Summarize using current style', false);
-		useCurrentStyleToggle.input.id = 'useCurrentStyleForSummary';
-		useCurrentStyleToggle.container.style.transition = 'opacity 0.2s';
-		leftPanel.appendChild(useCurrentStyleToggle.container);
-
 		// Use above model for summarization toggle
 		const useSelectedModelToggle = createClaudeToggle('Use above model for summarization instead of Haiku (High usage!)', false);
 		useSelectedModelToggle.input.id = 'useSelectedModelForSummary';
@@ -228,9 +222,6 @@ If this is a writing or creative discussion, include sections for characters, pl
 			useSelectedModelToggle.container.style.opacity = isSummarizing ? '1' : '0.4';
 			useSelectedModelToggle.container.style.pointerEvents = isSummarizing ? 'auto' : 'none';
 
-			useCurrentStyleToggle.container.style.opacity = isSummarizing ? '1' : '0.4';
-			useCurrentStyleToggle.container.style.pointerEvents = isSummarizing ? 'auto' : 'none';
-
 			// Token & preview (only when data available)
 			if (totalTokens === null || !fetchedMessages) return;
 
@@ -296,7 +287,6 @@ If this is a writing or creative discussion, include sections for characters, pl
 			pendingFork.keepFilesFromSummarized = keepFilesFromSummarizedToggle.input.checked;
 			pendingFork.keepToolCallsFromSummarized = keepToolCallsFromSummarizedToggle.input.checked;
 			pendingFork.useSelectedModelForSummary = useSelectedModelToggle.input.checked;
-			pendingFork.useCurrentStyleForSummary = useCurrentStyleToggle.input.checked;
 
 			modal.destroy();
 			await forkConversationClicked(messageUuid);
@@ -814,7 +804,7 @@ If this is a writing or creative discussion, include sections for characters, pl
 		}
 
 		// Get summary using the passed conversation
-		const assistantMessage = await tempConversation.sendMessageAndWaitForResponse(summaryMessage, { applyCurrentStyle: pendingFork.useCurrentStyleForSummary });
+		const assistantMessage = await tempConversation.sendMessageAndWaitForResponse(summaryMessage);
 
 		return ClaudeConversation.extractMessageText(assistantMessage);
 	}

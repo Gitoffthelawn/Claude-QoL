@@ -6,9 +6,6 @@
 
 	let pendingEditData = null;
 
-	const TEMP_STYLE_NAME = 'advanced_edit_temporary_style';
-	const TEMP_STYLE_STORAGE_KEY = 'temp_style_id';
-
 	// Working message for the current edit session
 	let editMessage = null;
 	// Map DOM elements to file instances for tracking
@@ -89,15 +86,9 @@
 					return;
 				}
 
-				const effectiveStyle = await getEffectiveStyle(orgId, conversationId);
-				const currentStyleText = effectiveStyle?.prompt || '';
+				await createEditModal(orgId, conversationId, existingMessage);
 
-				const result = await createEditModal(orgId, conversationId, existingMessage, currentStyleText);
-
-				pendingEditData = {
-					styleText: result.styleText,
-					originalStyleText: currentStyleText,
-				};
+				pendingEditData = {};
 				editButton.click();
 				setTimeout(() => autoSubmitEditWithText(editMessage.text), 100);
 			} catch (error) {
@@ -155,7 +146,7 @@
 	//#endregion
 
 	//#region Modal UI Construction
-	async function createEditModal(orgId, conversationId, existingMessage, currentStyleText) {
+	async function createEditModal(orgId, conversationId, existingMessage) {
 		const conversation = new ClaudeConversation(orgId, conversationId);
 
 		editMessage = new ClaudeMessage(conversation);
@@ -166,9 +157,6 @@
 			editMessage.attachFile(file);
 		}
 
-		let originalStyleText = currentStyleText;
-		if (originalStyleText === 'Normal') originalStyleText = '';
-
 		return new Promise((resolve, reject) => {
 			const content = document.createElement('div');
 			content.className = 'space-y-4';
@@ -176,7 +164,7 @@
 			const filesSection = buildFilesSection();
 			content.appendChild(filesSection);
 
-			const editorSection = buildEditorSection(editMessage.text, originalStyleText);
+			const editorSection = buildEditorSection(editMessage.text);
 			content.appendChild(editorSection);
 
 			const modal = new ClaudeModal('Edit Message', content);
@@ -193,24 +181,8 @@
 
 			// Add confirm button
 			const submitBtn = modal.addConfirm('Submit Edit', async (btn) => {
-				const modalData = collectModalData();
-
-				// Pre-validate style if it changed
-				if (modalData.styleText !== originalStyleText) {
-					const loadingModal = createLoadingModal('Preparing style...');
-					loadingModal.show();
-					try {
-						await ensureTempStyle(orgId, modalData.styleText);
-						loadingModal.destroy();
-					} catch (error) {
-						console.error('Error preparing style:', error);
-						loadingModal.destroy();
-						showClaudeAlert('Edit Error', error.message || 'Failed to prepare style');
-						return false;
-					}
-				}
-
-				resolve({ styleText: modalData.styleText });
+				collectModalData();
+				resolve();
 				return true;
 			});
 
@@ -263,31 +235,15 @@
 		return container;
 	}
 
-	function buildEditorSection(promptText, styleText) {
+	function buildEditorSection(promptText) {
 		const container = document.createElement('div');
 		container.className = 'border border-border-300 rounded-lg p-3';
 
-		// Toggle header
-		const header = document.createElement('div');
-		header.className = CLAUDE_CLASSES.FLEX_BETWEEN + ' mb-3';
 		const label = document.createElement('span');
-		label.className = 'text-sm font-medium text-text-200';
-		label.textContent = 'Editing:';
-		header.appendChild(label);
+		label.className = 'text-sm font-medium text-text-200 mb-2 block';
+		label.textContent = 'Message';
+		container.appendChild(label);
 
-		const { container: toggle, input: toggleInput } = createClaudeToggle('', false);
-		const promptLabel = document.createElement('span');
-		promptLabel.className = 'text-sm text-text-200';
-		promptLabel.textContent = 'Prompt';
-		const styleLabelEl = document.createElement('span');
-		styleLabelEl.className = 'text-sm text-text-200';
-		styleLabelEl.textContent = 'Style';
-		toggle.insertBefore(promptLabel, toggle.firstChild);
-		toggle.appendChild(styleLabelEl);
-		header.appendChild(toggle);
-		container.appendChild(header);
-
-		// Textareas
 		const promptTA = document.createElement('textarea');
 		promptTA.id = 'message-text';
 		promptTA.className = CLAUDE_CLASSES.INPUT;
@@ -299,39 +255,12 @@
 		promptTA.style.overflowY = 'auto';
 		container.appendChild(promptTA);
 
-		const styleTA = document.createElement('textarea');
-		styleTA.id = 'style-text';
-		styleTA.className = CLAUDE_CLASSES.INPUT;
-		styleTA.value = styleText;
-		styleTA.placeholder = 'Enter style instructions...';
-		styleTA.style.resize = 'none';
-		styleTA.style.minHeight = '150px';
-		styleTA.style.maxHeight = '400px';
-		styleTA.style.overflowY = 'auto';
-		styleTA.style.display = 'none';
-		container.appendChild(styleTA);
-
-		// Auto-resize each independently
 		const resize = (ta) => {
 			const maxHeight = parseInt(getComputedStyle(ta).maxHeight);
 			ta.style.height = 'auto';
 			ta.style.height = Math.min(ta.scrollHeight, maxHeight) + 'px';
 		};
 		promptTA.oninput = () => resize(promptTA);
-		styleTA.oninput = () => resize(styleTA);
-
-		// Toggle behavior
-		toggleInput.onchange = (e) => {
-			if (e.target.checked) {
-				promptTA.style.display = 'none';
-				styleTA.style.display = 'block';
-				setTimeout(() => resize(styleTA), 0);
-			} else {
-				styleTA.style.display = 'none';
-				promptTA.style.display = 'block';
-				setTimeout(() => resize(promptTA), 0);
-			}
-		};
 
 		setTimeout(() => resize(promptTA), 0);
 		return container;
@@ -704,12 +633,7 @@
 	}
 
 	function collectModalData() {
-		// Update editMessage text from textarea
 		editMessage.text = document.getElementById('message-text').value;
-		// Files are already managed in editMessage._files via addFile/removeFile
-		return {
-			styleText: document.getElementById('style-text').value
-		};
 	}
 
 	async function readTextFile(file) {
@@ -721,14 +645,8 @@
 		});
 	}
 
-	async function formatNewRequest(url, config, editData) {
+	function formatNewRequest(url, config) {
 		const originalBody = JSON.parse(config.body);
-
-		// Extract orgId from URL
-		const urlParts = url.split('/');
-		const orgId = urlParts[urlParts.indexOf('organizations') + 1];
-
-		// Get completion JSON from editMessage
 		const completionJson = editMessage.toCompletionJSON();
 
 		const modifiedBody = {
@@ -738,34 +656,6 @@
 			attachments: completionJson.attachments
 		};
 
-		// Only update style if it changed from what we showed in the modal
-		if (editData.styleText !== editData.originalStyleText) {
-			const tempStyleId = await ensureTempStyle(orgId, editData.styleText);
-			modifiedBody.personalized_styles = [{
-				key: tempStyleId,
-				uuid: tempStyleId,
-				prompt: editData.styleText,
-				name: TEMP_STYLE_NAME,
-				isDefault: false,
-				type: "custom",
-				summary: "This is a temporary style created for editing.",
-				attributes: [
-					{
-						"name": "Assertive",
-						"percentage": 0.7
-					},
-					{
-						"name": "Direct",
-						"percentage": 0.8
-					},
-					{
-						"name": "Uncompromising",
-						"percentage": 0.6
-					}
-				]
-			}];
-		}
-
 		return {
 			url,
 			config: {
@@ -773,53 +663,6 @@
 				body: JSON.stringify(modifiedBody)
 			}
 		};
-	}
-	//#endregion
-
-	//#region Style injector for temporary style
-	function getTempStyleId() {
-		return localStorage.getItem(TEMP_STYLE_STORAGE_KEY);
-	}
-
-	function setTempStyleId(styleId) {
-		localStorage.setItem(TEMP_STYLE_STORAGE_KEY, styleId);
-	}
-
-	async function createTempStyle(orgId, text) {
-		try {
-			const style = await createStyle(orgId, text, TEMP_STYLE_NAME);
-			setTempStyleId(style.uuid);
-			return style.uuid;
-		} catch (error) {
-			console.error('Error creating temp style:', error);
-			throw error;
-		}
-	}
-
-	async function updateTempStyle(orgId, styleId, text) {
-		return await updateStyle(orgId, styleId, text, TEMP_STYLE_NAME);
-	}
-
-	async function ensureTempStyle(orgId, text) {
-		let styleId = getTempStyleId();
-
-		if (!styleId) {
-			return await createTempStyle(orgId, text);
-		}
-
-		try {
-			await updateTempStyle(orgId, styleId, text);
-			return styleId;
-		} catch (error) {
-			// Only recreate if style is missing (404), otherwise re-throw
-			if (error.status === 404) {
-				console.log('Temp style not found, creating new one');
-				return await createTempStyle(orgId, text);
-			}
-
-			// For any other error (like 400 content filter), throw it
-			throw new Error(error.message);
-		}
 	}
 	//#endregion
 
@@ -840,11 +683,10 @@
 		// Intercept /completion requests when edit data is pending
 		if (url && url.includes('/completion') && pendingEditData && config?.method === 'POST') {
 			console.log('Intercepting edit completion request');
-			const editData = pendingEditData;
 			pendingEditData = null;
 
 			try {
-				const modifiedRequest = await formatNewRequest(url, config, editData);
+				const modifiedRequest = formatNewRequest(url, config);
 				cleanupEditState();
 				return originalFetch(modifiedRequest.url, modifiedRequest.config);
 			} catch (error) {
