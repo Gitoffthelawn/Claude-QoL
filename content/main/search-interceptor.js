@@ -35,9 +35,9 @@
 		}
 
 		// Check if this is a conversation search request
-		if (url && url.includes('/chat_conversations')) {
+		if (url && url.includes('/conversation/search')) {
 			const urlObj = new URL(url, window.location.origin);
-			const searchQuery = urlObj.searchParams.get('searchQuery');
+			const searchQuery = urlObj.searchParams.get('query');
 			lastSearchQuery = searchQuery; // Store the query
 
 			if (searchQuery) {
@@ -89,59 +89,30 @@
 		return originalFetch.apply(this, args);
 	};
 
-	// Attach click handlers to conversation links
-	function attachClickHandlers() {
-		if (!window.location.pathname.includes('/recents')) {
-			return;
-		}
+	// When a search result is clicked, remember the query for that conversation so the in-chat
+	// search auto-opens and highlights it on arrival. Delegated (capture phase) so it doesn't
+	// depend on the result's DOM text: in the v2 results table the conversation link is an empty
+	// overlay (title/snippet live in separate cells), so the old "(N matches)" text filter no
+	// longer matches anything. We identify result links structurally instead (inside the results
+	// <table>), which excludes the always-present sidebar /chat/ links.
+	document.addEventListener('click', (event) => {
+		if (!window.location.pathname.includes('/recents')) return;
+		if (sessionStorage.getItem('text_search_enabled') !== 'true') return;
+		if (!lastSearchQuery) return;
 
-		if (sessionStorage.getItem('text_search_enabled') !== 'true') {
-			return;
-		}
+		const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+		const link = target ? target.closest('a[href^="/chat/"]') : null;
+		if (!link || !link.closest('table')) return; // results live in a table; sidebar links don't
 
-		if (!lastSearchQuery) {
-			return;
-		}
+		const match = link.getAttribute('href').match(/\/chat\/([a-f0-9-]+)/);
+		if (!match) return;
 
-		const conversationLinks = document.querySelectorAll('a[href^="/chat/"]');
-
-		conversationLinks.forEach(link => {
-			// Only attach to links that contain our match count pattern
-			if (!/\(\d+ match(es)?\)/.test(link.textContent)) {
-				return;
-			}
-
-			if (link.dataset.searchHandlerAttached) {
-				return;
-			}
-
-			console.log('[QOL-SearchInterceptor] Attaching handler to:', link.textContent.substring(0, 50));
-			link.dataset.searchHandlerAttached = 'true';
-
-			link.addEventListener('click', () => {
-				console.log('[QOL-SearchInterceptor] Link clicked!');
-
-				// Extract conversation ID from href
-				const match = link.getAttribute('href').match(/\/chat\/([a-f0-9-]+)/);
-				if (!match) {
-					console.log('[QOL-SearchInterceptor] Could not extract conversation ID from:', link.getAttribute('href'));
-					return;
-				}
-
-				const conversationId = match[1];
-				//console.log('[QOL-SearchInterceptor] Storing query for conversation:', conversationId, lastSearchQuery);
-
-				// Get existing queries object
-				const queries = JSON.parse(localStorage.getItem('global_search_queries') || '{}');
-				queries[conversationId] = lastSearchQuery;
-				localStorage.setItem('global_search_queries', JSON.stringify(queries));
-				//console.log('[QOL-SearchInterceptor] Stored queries:', queries);
-			});
-		});
-	}
-
-	// Run click handler attachment periodically
-	setInterval(attachClickHandlers, 500);
+		const conversationId = match[1];
+		const queries = JSON.parse(localStorage.getItem('global_search_queries') || '{}');
+		queries[conversationId] = lastSearchQuery;
+		localStorage.setItem('global_search_queries', JSON.stringify(queries));
+		console.log('[QOL-SearchInterceptor] Stored query for conversation:', conversationId);
+	}, true);
 
 	console.log('[QOL-SearchInterceptor] Installed');
 })();

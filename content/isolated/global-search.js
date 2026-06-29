@@ -214,19 +214,50 @@
 	let gdprProcessedConversations = 0;
 	let gdprBatchQueue = [];
 	let gdprProcessing = false;
+	let gdprAllBatchesReceived = false;
 
-	chrome.runtime.onMessage.addListener(async (message) => {
+	chrome.runtime.onMessage.addListener((message) => {
+		// NOTE: this listener must NOT be async. An async listener returns a Promise, which makes
+		// Firefox hold the message channel open ("Promised response from onMessage listener went
+		// out of scope"). We respond to nothing here, so return undefined.
 		if (message.type === 'GDPR_BATCH') {
-			// Add to queue
 			gdprBatchQueue.push(message);
 			gdprTotalConversations = message.total;
-
-			// Start processing if not already
 			if (!gdprProcessing) {
 				processBatchQueue();
 			}
+		} else if (message.type === 'GDPR_COMPLETE') {
+			// Authoritative "all batches sent" signal. Finishing on this (rather than an exact
+			// processed-vs-total count) means a dropped/miscounted batch can't hang the modal.
+			gdprAllBatchesReceived = true;
+			if (!gdprProcessing && gdprBatchQueue.length === 0) {
+				finishGdprImport();
+			}
+		} else if (message.type === 'GDPR_ERROR') {
+			console.error('[QOL-GDPRExport] Import failed:', message.error);
+			gdprBatchQueue = [];
+			gdprProcessing = false;
+			gdprAllBatchesReceived = false;
+			gdprProcessedConversations = 0;
+			gdprTotalConversations = 0;
+			if (gdprLoadingModal) {
+				gdprLoadingModal.destroy();
+				gdprLoadingModal = null;
+			}
+			showClaudeAlert('Import Failed', `The data export import failed: ${message.error}`);
 		}
 	});
+
+	function finishGdprImport() {
+		console.log('[QOL-GDPRExport] All conversations processed');
+		if (gdprLoadingModal) {
+			gdprLoadingModal.destroy();
+			gdprLoadingModal = null;
+		}
+		gdprProcessedConversations = 0;
+		gdprTotalConversations = 0;
+		gdprAllBatchesReceived = false;
+	}
 
 	async function processBatchQueue() {
 		gdprProcessing = true;
@@ -255,19 +286,32 @@
 					`Loading ${gdprProcessedConversations} of ${gdprTotalConversations} conversations...`
 				));
 			}
-
-			if (gdprProcessedConversations >= gdprTotalConversations) {
-				console.log('[QOL-GDPRExport] All conversations processed');
-				if (gdprLoadingModal) {
-					gdprLoadingModal.destroy();
-					gdprLoadingModal = null;
-				}
-				gdprProcessedConversations = 0;
-				gdprTotalConversations = 0;
-			}
 		}
 
 		gdprProcessing = false;
+
+		// If the background has signalled completion and the queue is drained, we're done.
+		if (gdprAllBatchesReceived && gdprBatchQueue.length === 0) {
+			finishGdprImport();
+		}
+	}
+
+	// Resolve a single export download nonce to its signed GCS URL via the export_signed_url API.
+	// Returns { ready: true, signedUrl } once ready — note this success CONSUMES the nonce — or
+	// { ready: false, status, message } while still generating ('export_link_not_found') or if it
+	// was already consumed ('export_link_used').
+	async function resolveExportSignedUrl(orgId, nonce) {
+		const response = await fetch(`/api/organizations/${orgId}/export_signed_url/${nonce}`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' }
+		});
+		if (response.status === 200) {
+			const data = await response.json();
+			return { ready: true, signedUrl: data.signed_url };
+		}
+		let message = null;
+		try { message = (await response.json()).error?.message; } catch (e) { /* ignore */ }
+		return { ready: false, status: response.status, message };
 	}
 
 	async function syncConversationsViaExport(loadingModal) {
@@ -296,11 +340,14 @@
 		const nonce = exportData.nonce;
 		console.log('[QOL-GDPRExport] Export requested, nonce:', nonce);
 
-		// Phase 2: Poll for completion
+		// Phase 2: Poll export_signed_url until the export is ready.
+		// While generating it returns 404 'export_link_not_found' (does NOT consume the nonce);
+		// once ready it returns 200 { signed_url } AND consumes the nonce — so we keep and use that
+		// signed URL directly here (re-POSTing the nonce afterward yields 'export_link_used').
 		const POLL_INTERVAL_MS = 30000; // 30 seconds
 		const CHECK_IN_INTERVAL_MS = 180000; // 3 minutes
 
-		let storageUrl = null;
+		let manifestSignedUrl = null;
 		let lastCheckInTime = Date.now();
 
 		while (true) {
@@ -311,24 +358,19 @@
 				`Waiting for export to complete...\nChecking in in ${mins}m ${secs}s...`
 			));
 
-			const downloadPageUrl = `https://claude.ai/export/${orgId}/download/${nonce}`;
-
 			try {
-				const pollResponse = await fetch(downloadPageUrl);
-
-				if (pollResponse.status === 200) {
-					const html = await pollResponse.text();
-
-					// Extract storage URL from the HTML
-					const urlMatch = html.match(/https:\/\/storage\.googleapis\.com\/user-data-export-production\/[^"]+/);
-
-					if (urlMatch) {
-						storageUrl = urlMatch[0].replace(/\\u0026/g, '&');
-						console.log('[QOL-GDPRExport] Found storage URL');
-						break;
-					}
+				const result = await resolveExportSignedUrl(orgId, nonce);
+				if (result.ready) {
+					manifestSignedUrl = result.signedUrl;
+					console.log('[QOL-GDPRExport] Export ready, got manifest URL');
+					break;
 				}
+				if (result.message === 'export_link_used') {
+					throw new Error('Export link already used');
+				}
+				// 'export_link_not_found' → still generating, keep waiting.
 			} catch (error) {
+				if (error.message === 'Export link already used') throw error;
 				console.warn(`[QOL-GDPRExport] Poll failed:`, error.message);
 			}
 
@@ -352,26 +394,61 @@
 			}
 		}
 
-		// Phase 3: Request download from background
-		console.log('[QOL-GDPRExport] Requesting download from background script...');
+		// Phase 3: Fetch the manifest and resolve each batch nonce to a signed ZIP URL.
+		// GCS signed URLs are CORS-blocked from the page, so the background fetches them.
 		loadingModal.setContent(createLoadingContent('Downloading and processing export...'));
 
+		const manifestResult = await new Promise((resolve) => {
+			chrome.runtime.sendMessage({ type: 'GDPR_FETCH_MANIFEST', url: manifestSignedUrl }, resolve);
+		});
+		if (!manifestResult || !manifestResult.success) {
+			throw new Error(`Manifest fetch failed: ${manifestResult ? manifestResult.error : 'no response'}`);
+		}
+
+		const dataFiles = (manifestResult.manifest.data_files || [])
+			.slice()
+			.sort((a, b) => a.batch_index - b.batch_index);
+		console.log('[QOL-GDPRExport] Manifest lists', dataFiles.length, 'batch file(s)');
+
+		const zipUrls = [];
+		for (const file of dataFiles) {
+			const batchNonce = file.export_url.split('/').pop();
+			let resolved = await resolveExportSignedUrl(orgId, batchNonce);
+			// Batches of a freshly-generated export should be ready immediately; retry briefly.
+			let attempts = 0;
+			while (!resolved.ready && resolved.message === 'export_link_not_found' && attempts < 5) {
+				await new Promise(r => setTimeout(r, 2000));
+				resolved = await resolveExportSignedUrl(orgId, batchNonce);
+				attempts++;
+			}
+			if (!resolved.ready) {
+				throw new Error(`Batch ${file.batch_index} unavailable: ${resolved.message || resolved.status}`);
+			}
+			zipUrls.push(resolved.signedUrl);
+		}
+
+		// Phase 4: Hand the ZIP URLs to the background to download, unzip and stream back.
+		// Reset streaming state for this import, then show the import modal before kicking it off
+		// (the background may start streaming GDPR_BATCH the moment it responds).
+		gdprBatchQueue = [];
+		gdprProcessing = false;
+		gdprAllBatchesReceived = false;
+		gdprProcessedConversations = 0;
+		gdprTotalConversations = 0;
+
 		gdprLoadingModal = createLoadingModal('Importing...');
+		gdprLoadingModal.show();
 		const downloadResult = await new Promise((resolve) => {
-			chrome.runtime.sendMessage({
-				type: 'DOWNLOAD_GDPR_EXPORT',
-				url: storageUrl
-			}, resolve);
+			chrome.runtime.sendMessage({ type: 'DOWNLOAD_GDPR_EXPORT', zipUrls }, resolve);
 		});
 
-		if (!downloadResult.success) {
+		if (!downloadResult || !downloadResult.success) {
 			gdprLoadingModal.destroy();
 			gdprLoadingModal = null;
-			throw new Error(`Download failed: ${downloadResult.error}`);
+			throw new Error(`Download failed: ${downloadResult ? downloadResult.error : 'no response'}`);
 		}
 
 		console.log('[QOL-GDPRExport] Processing', downloadResult.totalCount, 'conversations...');
-		gdprLoadingModal.show();
 	}
 
 	function transformGDPRToMetadata(gdprConv) {
@@ -435,6 +512,43 @@
 		}
 	});
 
+	// All case-insensitive occurrences of `lowerQuery` within `text`, as {start, end} offsets.
+	function findMatches(text, lowerQuery) {
+		if (!text || !lowerQuery) return [];
+		const lowerText = text.toLowerCase();
+		const out = [];
+		let from = 0;
+		while (true) {
+			const i = lowerText.indexOf(lowerQuery, from);
+			if (i === -1) break;
+			out.push({ start: i, end: i + lowerQuery.length });
+			from = i + lowerQuery.length;
+		}
+		return out;
+	}
+
+	// Build a ~snippetSize preview centred on the first occurrence of the query, with leading/
+	// trailing ellipses when truncated. Returns { text, matches } with matches as offsets into text.
+	function buildSnippet(text, lowerQuery, snippetSize = 160) {
+		if (!text) return { text: '', matches: [] };
+		const idx = text.toLowerCase().indexOf(lowerQuery);
+		if (idx === -1) {
+			return { text: text.slice(0, snippetSize) + (text.length > snippetSize ? '…' : ''), matches: [] };
+		}
+		const pad = Math.max(0, Math.floor((snippetSize - lowerQuery.length) / 2));
+		const start = Math.max(0, idx - pad);
+		const end = Math.min(text.length, idx + lowerQuery.length + pad);
+		const prefix = start > 0 ? '…' : '';
+		const suffix = end < text.length ? '…' : '';
+		const body = text.slice(start, end);
+		// Re-find occurrences within the visible window, offset by the leading ellipsis.
+		const matches = findMatches(body, lowerQuery).map(m => ({
+			start: m.start + prefix.length,
+			end: m.end + prefix.length
+		}));
+		return { text: prefix + body + suffix, matches };
+	}
+
 	// ======== SEARCH FUNCTION (NEW) ========
 	async function searchAllConversations(query) {
 		if (!query || query.trim() === '') {
@@ -470,19 +584,29 @@
 		}
 		const searchTime = performance.now() - searchStart;
 
-		// Look up metadata
+		// Build results in Claude's conversation/search/v2 shape:
+		// { conversation, matched_snippet: { text, matches }, title_matches }
+		const messagesByUuid = new Map(allMessages.map(m => [m.uuid, m]));
 		const results = matches.map(match => {
 			const metadata = allMetadata.find(m => m.uuid === match.uuid);
+			const entry = messagesByUuid.get(match.uuid);
+
+			// title_matches must reference the ORIGINAL name, before we append the count suffix.
+			const titleMatches = findMatches(metadata.name, lowerQuery);
+
 			return {
-				...metadata,
-				name: `${metadata.name} (${match.matchCount} match${match.matchCount > 1 ? 'es' : ''})`,
-				matchCount: match.matchCount
+				conversation: {
+					...metadata,
+					name: `${metadata.name} (${match.matchCount} match${match.matchCount > 1 ? 'es' : ''})`
+				},
+				matched_snippet: buildSnippet(entry ? entry.searchableText : '', lowerQuery),
+				title_matches: titleMatches
 			};
 		});
 
 		// Sort
 		results.sort((a, b) =>
-			new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+			new Date(b.conversation.updated_at).getTime() - new Date(a.conversation.updated_at).getTime()
 		);
 
 		const totalTime = performance.now() - totalStart;
