@@ -29,7 +29,7 @@ const CLAUDE_CLASSES = {
 
 	// Tooltip
 	TOOLTIP_WRAPPER: 'fixed left-0 top-0 min-w-max z-tooltip pointer-events-none',
-	TOOLTIP_CONTENT: 'px-2 rounded-[6px] bg-fill-primary text-on-primary text-[13px]/[18px] shadow-sm inline-flex items-center whitespace-nowrap gap-2 h-6',
+	TOOLTIP_CONTENT: 'px-2 rounded-[6px] bg-[var(--cds-tooltip-bg)] text-[var(--cds-tooltip-fg)] text-[13px]/[18px] shadow-sm dark:shadow-panel-sm inline-flex items-center whitespace-nowrap gap-2 h-6',
 
 	// Layout helpers
 	FLEX_CENTER: 'flex items-center justify-center',
