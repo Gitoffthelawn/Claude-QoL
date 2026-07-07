@@ -1,5 +1,1 @@
-Fix forking/etc buttons not injecting
-Fix global search
-Add model setting for custom TTS endpoints
-Fix newlines being stripped in HTML exports
-Update tooltips to match new styling
+Fix image display for new API shape
