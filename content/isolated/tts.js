@@ -10,326 +10,174 @@
         <path d="M10 2.5L5.5 5.5H2v5h3.5L10 13.5v-11z" stroke-linejoin="round"/>
         <path d="M13 5c1.5 1 1.5 5 0 6" stroke-linecap="round"/>
     </svg>`;
-
-	const PAUSE_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="#2c84db" viewBox="0 0 16 16" class="pause-icon">
-        <path d="M5.5 3.5A1.5 1.5 0 0 1 7 5v6a1.5 1.5 0 0 1-3 0V5a1.5 1.5 0 0 1 1.5-1.5zm5 0A1.5 1.5 0 0 1 12 5v6a1.5 1.5 0 0 1-3 0V5a1.5 1.5 0 0 1 1.5-1.5z"/>
-    </svg>`;
 	//#endregion
 
 	//#region Provider Instance
 	let ttsProvider = null;
 
-	function initializeProvider(providerKey, onStateChange) {
+	function initializeProvider(providerKey) {
 		const providerInfo = window.TTSProviders.TTS_PROVIDERS[providerKey];
-		if (!providerInfo) {
-			console.error('Unknown provider:', providerKey);
-			return null;
-		}
-		return new providerInfo.class(onStateChange);
+		// 'claude' (native passthrough) has class: null; unknown keys too.
+		if (!providerInfo || !providerInfo.class) return null;
+		return new providerInfo.class();
 	}
 
-	// Initialize with default
-	(async () => {
-		const settings = await loadSettings();
-		ttsProvider = initializeProvider(settings.provider, (state, isProcessing) => {
-			updateSettingsButton(state, isProcessing);
-		});
-	})();
-
-	function updateSettingsButton(state, isProcessing) {
-		console.log('[QOL-TTS] Called with:', { state, isProcessing });
-
-		const button = document.querySelector('.tts-settings-button');
-		if (!button) {
-			console.log('[QOL-TTS] Button not found in DOM');
-			return;
+	let ttsProviderKey = null;
+	function getProvider(providerKey) {
+		if (providerKey !== ttsProviderKey || !ttsProvider) {
+			ttsProvider = initializeProvider(providerKey);
+			ttsProviderKey = providerKey;
 		}
-
-		console.log('[QOL-TTS] Button found, updating...');
-
-		if (state === 'loading' || state === 'stopping') {
-			console.log('[QOL-TTS] Setting loading/stopping state');
-			button.innerHTML = `
-            <div class="relative w-5 h-5">
-                <svg class="spinner-segment absolute inset-0" xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 20 20">
-                    <path d="M10 2a8 8 0 0 1 0 16" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.3"/>
-                    <path d="M10 2a8 8 0 0 1 5.66 2.34" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                </svg>
-                <div class="absolute inset-0 flex items-center justify-center">
-                    ${PAUSE_ICON}
-                </div>
-            </div>
-        `;
-			ButtonBar.updateTooltip('tts-settings-button', state === 'loading' ? 'Loading audio...' : 'Stopping...');
-		} else if (state === 'playing' || isProcessing) {
-			console.log('[QOL-TTS] Setting playing state');
-			button.innerHTML = PAUSE_ICON;
-			ButtonBar.updateTooltip('tts-settings-button', 'Stop playback');
-		} else {
-			console.log('[QOL-TTS] Setting idle state');
-			button.innerHTML = SPEAKER_ICON;
-			ButtonBar.updateTooltip('tts-settings-button', 'TTS Settings');
-		}
+		return ttsProvider;
 	}
+
 	//#endregion
 
-	//#region Actor Mode Implementation
-	// Updated playback function that uses actor mode
-	async function playText(text, settings, conversationId) {
-		// Check if actor mode is enabled for this conversation
-		const actorModeEnabled = (await settingsRegistry.getPerChat(TP.ACTOR_MODE, conversationId)) === true;
+	//#region Synthesis (drives claude.ai's native player via the WS interceptor)
+	// The MAIN-world WS interceptor collects the native "Read aloud" text and asks us to synthesize.
+	// We produce 16kHz PCM via our provider and stream it back; native handles all playback.
 
-		// Get the voice for this chat (either override or default)
-		const voiceOverride = (await settingsRegistry.getPerChat(TP.VOICE, conversationId)) || '';
-		const defaultVoiceId = voiceOverride || settings.voice;
+	// requestId -> { abort: AbortController, cancelled: bool }
+	const activeSynth = new Map();
 
-		// Get baseUrl for OpenAI provider
+	// ~150ms of 16kHz mono s16le silence, primes native's player during actor-mode attribution latency.
+	const SILENCE_PRIMER_MS = 150;
+	function makeSilence(ms) {
+		return new Int16Array(Math.floor(16000 * ms / 1000)).buffer; // zeros
+	}
+
+	function postSynthDone(requestId) {
+		window.postMessage({ type: 'TTS_SYNTH_DONE', requestId }, '*');
+	}
+
+	function abortSynth(requestId) {
+		const entry = activeSynth.get(requestId);
+		if (entry) {
+			entry.cancelled = true;
+			entry.abort.abort();
+			activeSynth.delete(requestId);
+		}
+	}
+
+	async function handleSynthRequest({ requestId, text, conversationId }) {
+		const settings = await loadSettings();
+		const provider = getProvider(settings.provider);
+		// Defensive: MAIN gating should prevent this, but never leave native hanging.
+		if (!provider) { postSynthDone(requestId); return; }
+
+		const [actorModeEnabled, voiceOverride, quotesOnly, characters] = await Promise.all([
+			settingsRegistry.getPerChat(TP.ACTOR_MODE, conversationId).then(v => v === true),
+			settingsRegistry.getPerChat(TP.VOICE, conversationId).then(v => v || ''),
+			settingsRegistry.getPerChat(TP.QUOTES_ONLY, conversationId).then(v => v === true),
+			settingsRegistry.getPerChat(TP.CHARACTERS, conversationId).then(v => v || [])
+		]);
+
+		const defaultVoice = voiceOverride || settings.voice;
 		const baseUrl = settings.openaiBaseUrl || '';
+		const finalText = cleanupText(text, quotesOnly);
+		if (!finalText) { postSynthDone(requestId); return; } // e.g. quotes-only with no quotes
 
-		if (!actorModeEnabled) {
-			// Actor mode not enabled - use regular voice
-			return ttsProvider.play(text, defaultVoiceId, settings.model, settings.apiKey, baseUrl);
-		}
+		const entry = { abort: new AbortController(), cancelled: false };
+		activeSynth.set(requestId, entry);
+		const signal = entry.abort.signal;
 
-		// Actor mode is enabled - get character configurations
-		const characters = (await settingsRegistry.getPerChat(TP.CHARACTERS, conversationId)) || [];
-
-		if (characters.length === 0) {
-			console.log('Actor mode enabled but no characters configured, using default voice');
-			return ttsProvider.play(text, defaultVoiceId, settings.model, settings.apiKey, baseUrl);
-		}
+		const onChunk = (ab) => {
+			if (entry.cancelled) return;
+			// Structured-clone copy (no transfer list): this message is delivered to BOTH the MAIN
+			// and ISOLATED listeners on this window, so a transferable would be detached for one of
+			// them. The data rate is tiny (~32 KB/s at 16kHz mono), so copying is cheap.
+			window.postMessage({ type: 'TTS_SYNTH_PCM', requestId, chunk: ab }, '*');
+		};
 
 		try {
-			// Start actor mode session
-			const sessionId = await ttsProvider.startSession();
-
-			console.log('Getting dialogue attribution for actor mode...');
-
-			// Start the attribution request but DON'T await it yet
-			const attributionPromise = ttsProvider.attributeDialogueToCharacters(text, characters, settings.model);
-
-			// Check periodically if we've been interrupted while waiting
-			const checkInterval = setInterval(() => {
-				if (ttsProvider.getCurrentSessionId() !== sessionId) {
-					clearInterval(checkInterval);
-					console.log('Attribution cancelled - user interrupted');
-				}
-			}, 100);
-
-			// Now await the attribution
-			const segments = await attributionPromise;
-			clearInterval(checkInterval);
-
-			// Check if we should still use these results
-			if (ttsProvider.getCurrentSessionId() !== sessionId) {
-				console.log('Ignoring attribution results - session was interrupted');
-				return;
+			if (actorModeEnabled && characters.length > 0) {
+				await synthesizeActorMode(provider, finalText, characters, settings, baseUrl, signal, onChunk, entry);
+			} else {
+				await provider.synthesize(finalText, defaultVoice, settings.model, settings.apiKey, { baseUrl }, signal, onChunk);
 			}
-
-			// Create a voice map
-			const voiceMap = {};
-			characters.forEach(char => {
-				if (char.voice) {
-					voiceMap[char.name.toLowerCase()] = char.voice;
-				}
-			});
-
-			// Merge consecutive segments from the same character with matching extra
-			const mergedSegments = [];
-			let currentSegment = null;
-
-			for (const segment of segments) {
-				const characterName = segment.character.toLowerCase();
-				const extraStr = JSON.stringify(segment.extra || {});
-
-				if (currentSegment &&
-					currentSegment.character === characterName &&
-					currentSegment.extraStr === extraStr) {
-					currentSegment.text += ' ' + segment.text;
-				} else {
-					if (currentSegment) {
-						mergedSegments.push(currentSegment);
-					}
-					currentSegment = {
-						character: characterName,
-						text: segment.text,
-						extra: segment.extra || {},
-						extraStr: extraStr
-					};
-				}
-			}
-
-			if (currentSegment) {
-				mergedSegments.push(currentSegment);
-			}
-
-			console.log(`Merged ${segments.length} segments into ${mergedSegments.length} segments`);
-
-			// Queue all merged segments
-			for (const segment of mergedSegments) {
-				const voice = voiceMap[segment.character];
-
-				if (!voice) {
-					console.warn(`No voice available for ${segment.character}, skipping segment`);
-					continue;
-				}
-
-				console.log(`Queueing "${segment.text.substring(0, 50)}..." as ${segment.character} with voice ${voice}`);
-
-				await ttsProvider.queue(
-					segment.text,
-					voice,
-					settings.model,
-					settings.apiKey,
-					{ ...segment.extra, baseUrl }
-				);
-			}
-
-			// Wait for all segments to complete
-			await ttsProvider.waitForCompletion();
-
 		} catch (error) {
-			console.error('Actor mode failed, falling back to regular playback:', error);
-			return ttsProvider.play(text, defaultVoiceId, settings.model, settings.apiKey, baseUrl);
+			console.error('[QOL-TTS] Synthesis failed:', error);
+		} finally {
+			if (!entry.cancelled) postSynthDone(requestId);
+			activeSynth.delete(requestId);
+		}
+	}
+
+	async function synthesizeActorMode(provider, text, characters, settings, baseUrl, signal, onChunk, entry) {
+		// Prime the native player so it doesn't time out while attribution (an LLM round-trip) runs.
+		if (SILENCE_PRIMER_MS > 0) onChunk(makeSilence(SILENCE_PRIMER_MS));
+
+		const segments = await provider.attributeDialogueToCharacters(text, characters, settings.model);
+		if (entry.cancelled || signal.aborted) return;
+
+		const voiceMap = {};
+		characters.forEach(char => {
+			if (char.voice) voiceMap[char.name.toLowerCase()] = char.voice;
+		});
+
+		// Merge consecutive segments from the same character with matching extra (fewer API calls).
+		const mergedSegments = [];
+		let currentSegment = null;
+		for (const segment of segments) {
+			const characterName = segment.character.toLowerCase();
+			const extraStr = JSON.stringify(segment.extra || {});
+			if (currentSegment && currentSegment.character === characterName && currentSegment.extraStr === extraStr) {
+				currentSegment.text += ' ' + segment.text;
+			} else {
+				if (currentSegment) mergedSegments.push(currentSegment);
+				currentSegment = { character: characterName, text: segment.text, extra: segment.extra || {}, extraStr };
+			}
+		}
+		if (currentSegment) mergedSegments.push(currentSegment);
+
+		// Synthesize sequentially so PCM stays ordered; native concatenates the frames gaplessly.
+		for (const segment of mergedSegments) {
+			if (entry.cancelled || signal.aborted) return;
+			const voice = voiceMap[segment.character];
+			if (!voice) continue; // character mapped to no voice -> skip
+			await provider.synthesize(segment.text, voice, settings.model, settings.apiKey, { ...segment.extra, baseUrl }, signal, onChunk);
 		}
 	}
 	//#endregion
 
 	//#region Message Listener
-	let isCapturingText = false;
-	let capturedText = null;
-
 	window.addEventListener('message', async (event) => {
-		if (event.data.type === 'tts-auto-speak') {
+		if (event.source !== window || !event.data) return;
+		const d = event.data;
+
+		if (d.type === 'TTS_SYNTH_REQUEST') {
+			handleSynthRequest(d);
+		} else if (d.type === 'TTS_SYNTH_ABORT') {
+			abortSynth(d.requestId);
+		} else if (d.type === 'TTS_HIJACK_CONFIG_REQUEST') {
+			pushHijackConfig();
+		} else if (d.type === 'tts-auto-speak') {
 			const settings = await loadSettings();
-			if (!settings.enabled || !settings.autoSpeak) return;
+			if (!settings.autoSpeak) return;
 
-			const { messageUuid } = event.data;
-
-			// Retry logic to find the speak button (DOM might not be ready)
+			const { messageUuid } = d;
+			// Retry logic to find the native button (DOM might not be ready yet).
 			const maxRetries = 10;
 			const retryDelay = 300;
-
 			for (let attempt = 0; attempt < maxRetries; attempt++) {
 				const messageElement = document.querySelector(`[data-message-uuid="${messageUuid}"]`);
 				if (messageElement) {
-					const speakButton = messageElement.querySelector('.tts-speak-button');
-					if (speakButton) {
-						console.log('Auto-speaking message:', messageUuid);
-						speakButton.click();
+					const nativeBtn = messageElement.querySelector('button[data-testid="action-bar-read-aloud"]');
+					if (nativeBtn) {
+						nativeBtn.click();
 						return;
 					}
 				}
-
 				if (attempt < maxRetries - 1) {
 					await new Promise(r => setTimeout(r, retryDelay));
 				}
 			}
-			console.log('Could not find speak button for message:', messageUuid);
-		} else if (event.data.type === 'tts-clipboard-request') {
-			const { text, requestId } = event.data;
-
-			if (isCapturingText) {
-				// We're capturing - store the text and intercept
-				capturedText = text;
-				isCapturingText = false;
-
-				window.postMessage({
-					type: 'tts-clipboard-response',
-					requestId: requestId,
-					shouldIntercept: true
-				}, '*');
-			} else {
-				// Normal copy - allow it
-				window.postMessage({
-					type: 'tts-clipboard-response',
-					requestId: requestId,
-					shouldIntercept: false
-				}, '*');
-			}
+			console.log('[QOL-TTS] Could not find native read-aloud button for message:', messageUuid);
 		}
 	});
 	//#endregion
 
-	//#region Message Buttons
-	function createSpeakButton() {
-		const button = createClaudeButton(SPEAKER_ICON, 'icon-message', async (e) => {
-			e.preventDefault();
-			e.stopPropagation();
-
-			// Get text from message
-			const text = await captureMessageText(button);
-			if (!text) {
-				showClaudeAlert('Error', 'Failed to capture message text');
-				return;
-			}
-
-			// Get settings
-			const settings = await loadSettings();
-			const conversationId = getConversationId();
-
-
-			const quotesOnly = (await settingsRegistry.getPerChat(TP.QUOTES_ONLY, conversationId)) === true; // Explicitly check for true
-
-			if (ttsProvider && ttsProvider.requiresApiKey && settings.apiKey) {
-				const isValid = await ttsProvider.testApiKey(settings.apiKey);
-				if (!isValid) {
-					showClaudeAlert('API Key Error', 'Invalid API key.');
-					return;
-				}
-			} else if (ttsProvider.requiresApiKey && !settings.apiKey) {
-				showClaudeAlert('API Key Required', 'Provider requires an API key. Please enter one.');
-				return;
-			}
-
-			// Process text with per-chat quotes setting
-			const finalText = cleanupText(text, quotesOnly);
-			if (!finalText) {
-				showClaudeAlert('No Text Available', 'No text to speak' + (quotesOnly ? ' (no quoted text found)' : ''));
-				return;
-			}
-
-			// Start playback (will handle stopping existing playback internally)
-			try {
-				await playText(finalText, settings, conversationId);
-			} catch (error) {
-				showClaudeAlert('Playback Error', 'Failed to play audio: ' + error.message);
-			}
-		});
-
-		// Add identification class
-		button.classList.add('tts-speak-button');
-
-		createClaudeTooltip(button, 'Read aloud');
-
-		return button;
-	}
-
-	async function captureMessageText(button) {
-		const controls = button.closest('.justify-between');
-		const copyButton = controls?.querySelector('[data-testid="action-bar-copy"]');
-
-		if (!copyButton) {
-			console.error('Could not find copy button');
-			return null;
-		}
-
-		// Set capture flag
-		isCapturingText = true;
-		capturedText = null;
-
-		// Click copy button - this will trigger our interceptor
-		copyButton.click();
-
-		// Wait for clipboard interception to complete
-		await new Promise(resolve => setTimeout(resolve, 100));
-
-		// Reset flag in case it didn't get caught
-		isCapturingText = false;
-
-		return capturedText;
-	}
-
+	//#region Text Cleanup
 	function cleanupText(text, quotesOnly = false) {
 		// Remove triple-backtick code blocks
 		text = text.replace(/```[\s\S]*?```/g, '');
@@ -348,11 +196,6 @@
 			return quotes.map(q => q.slice(1, -1)).join(". ");
 		}
 		return text;
-	}
-
-	function removeAllSpeakButtons() {
-		const buttons = document.querySelectorAll('.tts-speak-button');
-		buttons.forEach(btn => btn.remove());
 	}
 	//#endregion
 
@@ -379,6 +222,8 @@
 				label: info.name
 			}));
 			const currentProviderInfo = window.TTSProviders.TTS_PROVIDERS[settings.provider];
+			// 'claude' is native passthrough: no key/voice/model of ours, native TTS handles it.
+			const isNative = (key) => !!window.TTSProviders.TTS_PROVIDERS[key]?.native;
 
 			// When OpenAI is used with a custom Base URL, the hardcoded model dropdown
 			// can't name the custom endpoint's models, so use a free-text input instead.
@@ -394,11 +239,13 @@
 					tempProvider.getModels(settings.apiKey)
 				]);
 			} else if (!currentProviderInfo.requiresApiKey) {
-				const tempProvider = initializeProvider(settings.provider, null);
-				[voices, models] = await Promise.all([
-					tempProvider.getVoices(),
-					tempProvider.getModels()
-				]);
+				const tempProvider = initializeProvider(settings.provider);
+				if (tempProvider) {
+					[voices, models] = await Promise.all([
+						tempProvider.getVoices(),
+						tempProvider.getModels()
+					]);
+				}
 			}
 
 			// Close loading modal and show the actual settings modal
@@ -406,13 +253,6 @@
 
 			// Build content
 			const content = document.createElement('div');
-
-			// Enable TTS toggle
-			const enableSection = document.createElement('div');
-			enableSection.className = 'mb-4';
-			const enabledToggle = createClaudeToggle('Enable TTS', settings.enabled, null);
-			enableSection.appendChild(enabledToggle.container);
-			content.appendChild(enableSection);
 
 			// Provider select
 			const providerSection = document.createElement('div');
@@ -425,6 +265,14 @@
 			providerSelect.id = 'providerSelect';
 			providerSection.appendChild(providerSelect);
 			content.appendChild(providerSection);
+
+			// Native (Claude built-in) note — shown when the 'claude' passthrough provider is selected
+			const nativeNote = document.createElement('p');
+			nativeNote.id = 'ttsNativeNote';
+			nativeNote.className = CLAUDE_CLASSES.TEXT_MUTED + ' mb-4';
+			nativeNote.textContent = "Using Claude's built-in voice (set it in Claude's own settings). Pick ElevenLabs or OpenAI to use a custom voice.";
+			nativeNote.style.display = isNative(settings.provider) ? 'block' : 'none';
+			content.appendChild(nativeNote);
 
 			// API Key input
 			const apiKeySection = document.createElement('div');
@@ -469,6 +317,8 @@
 			// Voice select
 			const voiceSection = document.createElement('div');
 			voiceSection.className = 'mb-4';
+			voiceSection.id = 'voiceSection';
+			voiceSection.style.display = isNative(settings.provider) ? 'none' : 'block';
 			const voiceLabel = document.createElement('label');
 			voiceLabel.className = CLAUDE_CLASSES.LABEL;
 			voiceLabel.textContent = 'Voice';
@@ -499,14 +349,14 @@
 			modelSelect.id = 'modelSelect';
 			modelSelect.disabled = currentProviderInfo.requiresApiKey && !settings.apiKey;
 			modelSection.appendChild(modelSelect);
-			modelSection.style.display = useCustomModel(settings.provider, settings.openaiBaseUrl) ? 'none' : 'block';
+			modelSection.style.display = (isNative(settings.provider) || useCustomModel(settings.provider, settings.openaiBaseUrl)) ? 'none' : 'block';
 			content.appendChild(modelSection);
 
 			// Custom model input (OpenAI with a custom Base URL)
 			const modelCustomSection = document.createElement('div');
 			modelCustomSection.className = 'mb-4';
 			modelCustomSection.id = 'modelCustomSection';
-			modelCustomSection.style.display = useCustomModel(settings.provider, settings.openaiBaseUrl) ? 'block' : 'none';
+			modelCustomSection.style.display = (!isNative(settings.provider) && useCustomModel(settings.provider, settings.openaiBaseUrl)) ? 'block' : 'none';
 			const modelCustomLabel = document.createElement('label');
 			modelCustomLabel.className = CLAUDE_CLASSES.LABEL;
 			modelCustomLabel.textContent = 'Model';
@@ -604,7 +454,6 @@
 			modal.addCancel('Cancel');
 			modal.addConfirm('Save', async () => {
 				const newSettings = {
-					enabled: enabledToggle.input.checked,
 					provider: providerSelect.value,
 					apiKey: apiKeyInput.value.trim(),
 					voice: voiceSelect.value,
@@ -657,19 +506,14 @@
 					}
 				}
 
-				// Reinitialize provider if changed
-				if (newSettings.provider !== settings.provider) {
-					ttsProvider = initializeProvider(newSettings.provider, (state, isProcessing) => {
-						updateSettingsButton(state, isProcessing);
-					});
-				}
+				// Drop the cached provider so the next synth request re-inits with the new settings.
+				ttsProvider = null;
+				ttsProviderKey = null;
 
 				await saveSettings(newSettings);
 
-				// Update button visibility based on enabled state
-				if (!newSettings.enabled) {
-					removeAllSpeakButtons();
-				}
+				// Reload so the MAIN WS interceptor picks up the new provider / hijack state cleanly.
+				window.location.reload();
 			});
 
 			// Handle mutual exclusivity between quotes-only and actor mode
@@ -703,19 +547,22 @@
 			providerSelect.addEventListener('change', async (e) => {
 				const newProviderKey = e.target.value;
 				const newProviderInfo = window.TTSProviders.TTS_PROVIDERS[newProviderKey];
+				const native = isNative(newProviderKey);
 
-				// Show/hide API key section
-				apiKeySection.style.display = newProviderInfo.requiresApiKey ? 'block' : 'none';
+				// Native (Claude built-in): hide all of our provider config.
+				nativeNote.style.display = native ? 'block' : 'none';
+				apiKeySection.style.display = (!native && newProviderInfo.requiresApiKey) ? 'block' : 'none';
+				baseUrlSection.style.display = (!native && newProviderKey === 'openai') ? 'block' : 'none';
+				voiceSection.style.display = native ? 'none' : 'block';
 
-				// Show/hide base URL section (only for OpenAI)
-				baseUrlSection.style.display = newProviderKey === 'openai' ? 'block' : 'none';
-
-				// Swap between the model dropdown and the custom-model input
+				// Swap between the model dropdown and the custom-model input (both hidden when native)
 				const custom = useCustomModel(newProviderKey, baseUrlInput.value);
-				modelSection.style.display = custom ? 'none' : 'block';
-				modelCustomSection.style.display = custom ? 'block' : 'none';
+				modelSection.style.display = (native || custom) ? 'none' : 'block';
+				modelCustomSection.style.display = (!native && custom) ? 'block' : 'none';
 
-				const tempProvider = initializeProvider(newProviderKey, null);
+				if (native) return; // nothing of ours to load
+
+				const tempProvider = initializeProvider(newProviderKey);
 
 				// Check if we need to load data
 				if (newProviderInfo.requiresApiKey) {
@@ -845,10 +692,12 @@
 			const providerInfo = window.TTSProviders.TTS_PROVIDERS[providerKey];
 
 			let voices = [];
-			if (providerInfo.requiresApiKey && apiKey) {
-				voices = await tempProvider.getVoices(apiKey);
-			} else if (!providerInfo.requiresApiKey) {
-				voices = await tempProvider.getVoices();
+			if (tempProvider) {
+				if (providerInfo.requiresApiKey && apiKey) {
+					voices = await tempProvider.getVoices(apiKey);
+				} else if (!providerInfo.requiresApiKey) {
+					voices = await tempProvider.getVoices();
+				}
 			}
 
 			// Close loading modal
@@ -1036,8 +885,7 @@
 	}
 
 	async function loadSettings() {
-		const [enabled, provider, apiKey, voice, model, autoSpeak, openaiBaseUrl] = await Promise.all([
-			settingsRegistry.get(T.ENABLED),
+		const [provider, apiKey, voice, model, autoSpeak, openaiBaseUrl] = await Promise.all([
 			settingsRegistry.get(T.PROVIDER),
 			settingsRegistry.get(T.API_KEY),
 			settingsRegistry.get(T.VOICE),
@@ -1047,7 +895,6 @@
 		]);
 
 		return {
-			enabled,
 			provider,
 			apiKey,
 			voice,
@@ -1059,7 +906,6 @@
 
 	async function saveSettings(settings) {
 		await Promise.all([
-			settingsRegistry.set(T.ENABLED, settings.enabled),
 			settingsRegistry.set(T.PROVIDER, settings.provider),
 			settingsRegistry.set(T.API_KEY, settings.apiKey),
 			settingsRegistry.set(T.VOICE, settings.voice),
@@ -1073,55 +919,69 @@
 	//#region Settings Button
 	function createSettingsButton() {
 		const button = createClaudeButton(SPEAKER_ICON, 'icon', async () => {
-			if (ttsProvider && ttsProvider.isActive()) {
-				ttsProvider.stop();
-			} else {
-				await createSettingsModal();
-			}
+			await createSettingsModal();
 		});
 
-		button.classList.add('tts-settings-button'); // Keep for identification/priority
+		button.classList.add('tts-settings-button');
+		refreshTTSButtonColor(button);
 		return button;
+	}
+
+	// Tints the toolbar icon blue when a custom (non-native) provider is active.
+	async function refreshTTSButtonColor(button) {
+		button = button || document.querySelector('.tts-settings-button');
+		if (!button) return;
+		const provider = await settingsRegistry.get(T.PROVIDER);
+		button.classList.toggle('tts-custom-provider', !!provider && provider !== 'claude');
+	}
+	//#endregion
+
+	//#region Config sync + Migration
+	// Gate: hijack the native TTS socket only when a premium provider is fully configured.
+	async function computeHijack() {
+		const [provider, apiKey, voice] = await Promise.all([
+			settingsRegistry.get(T.PROVIDER),
+			settingsRegistry.get(T.API_KEY),
+			settingsRegistry.get(T.VOICE)
+		]);
+		return !!provider && provider !== 'claude' && !!apiKey && !!voice;
+	}
+
+	async function pushHijackConfig() {
+		window.postMessage({ type: 'TTS_HIJACK_CONFIG', hijack: await computeHijack() }, '*');
+	}
+
+	// One-time migration from the old enable-toggle to the provider-as-gate model.
+	async function migrateEnabledSetting() {
+		const raw = await chrome.storage.local.get(T.ENABLED.key);
+		if (!(T.ENABLED.key in raw)) return; // never set, or already migrated
+		const legacyEnabled = raw[T.ENABLED.key];
+		const provider = await settingsRegistry.get(T.PROVIDER);
+		// Disabled users, and Browser-provider users (Browser dropped), fall back to native TTS.
+		if (legacyEnabled === false || provider === 'browser') {
+			await settingsRegistry.set(T.PROVIDER, 'claude');
+		}
+		await chrome.storage.local.remove(T.ENABLED.key); // absence marks migration complete
 	}
 	//#endregion
 
 	//#region Initialization
-	let currentUrl = window.location.href;
-
-	setInterval(() => {
-		if (window.location.href !== currentUrl) {
-			currentUrl = window.location.href;
-			// Stop playback on navigation
-			if (ttsProvider.isActive()) {
-				ttsProvider.stop();
-			}
-		}
-	}, 100);
-
 	function addTTSStyles() {
 		if (document.querySelector('#tts-styles')) return;
 
 		const style = document.createElement('style');
 		style.id = 'tts-styles';
 		style.textContent = `
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        .spinner-segment {
-            animation: spin 1s linear infinite;
-        }
-        .tts-settings-button:hover .pause-icon {
-            fill: #2573c4 !important;
-        }
-        .tts-settings-button .pause-icon {
-            transition: fill 0.2s ease;
+        .tts-settings-button.tts-custom-provider {
+            color: #2c84db;
         }
     `;
 		document.head.appendChild(style);
 	}
 
-	function initialize() {
+	async function initialize() {
 		addTTSStyles();
+		await migrateEnabledSetting();
 		ButtonBar.register({
 			buttonClass: 'tts-settings-button',
 			createFn: createSettingsButton,
@@ -1129,13 +989,11 @@
 			forceDisplayOnMobile: true,
 			pages: ['chat', 'home', 'coworkHome', 'coworkChat'],
 		});
-		MessageButtonBar.register({
-			buttonClass: 'tts-speak-button',
-			target: 'assistant',
-			createFn: createSpeakButton,
-			pages: ['chat', 'coworkChat'],
-			shouldInject: async () => (await loadSettings()).enabled,
-		});
+		pushHijackConfig();
+		// Re-push the hijack decision + recolor the icon whenever a relevant setting changes.
+		[T.PROVIDER, T.API_KEY, T.VOICE, T.BASE_URL].forEach(k =>
+			settingsRegistry.onChange(k, () => { pushHijackConfig(); refreshTTSButtonColor(); })
+		);
 	}
 
 	// Wait for DOM to be ready before initializing

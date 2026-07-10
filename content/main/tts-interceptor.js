@@ -2,64 +2,6 @@
 (function () {
 	'use strict';
 
-	// Override clipboard API
-	const originalWrite = navigator.clipboard.write;
-	navigator.clipboard.write = async (data) => {
-		// Extract text from clipboard data
-		let capturedText = null;
-		try {
-			const item = data[0];
-			if (item && item.types.includes('text/plain')) {
-				const blob = await item.getType('text/plain');
-				capturedText = await blob.text();
-
-				// Strip phantom/UUID markers
-				capturedText = capturedText.replace(/====PHANTOM_MESSAGE====/g, '');
-				capturedText = capturedText.replace(/====UUID:[a-f0-9-]+====/gi, '');
-				capturedText = capturedText.replace(/\n{3,}/g, '\n\n').trim();
-			}
-		} catch (error) {
-			console.error('Error extracting clipboard text:', error);
-		}
-
-		if (capturedText) {
-			// Ask ISOLATED script if we should intercept this copy
-			const shouldIntercept = await new Promise((resolve) => {
-				const requestId = Math.random().toString(36).substr(2, 9);
-
-				const listener = (event) => {
-					if (event.data.type === 'tts-clipboard-response' &&
-						event.data.requestId === requestId) {
-						window.removeEventListener('message', listener);
-						resolve(event.data.shouldIntercept);
-					}
-				};
-
-				window.addEventListener('message', listener);
-
-				window.postMessage({
-					type: 'tts-clipboard-request',
-					text: capturedText,
-					requestId: requestId
-				}, '*');
-
-				// Timeout after 50ms - default to allowing copy
-				setTimeout(() => {
-					window.removeEventListener('message', listener);
-					resolve(false);
-				}, 50);
-			});
-
-			if (shouldIntercept) {
-				// Intercept - don't actually copy to clipboard
-				return Promise.resolve();
-			}
-		}
-
-		// Normal copy operation
-		return originalWrite.call(navigator.clipboard, data);
-	};
-
 	// Helper to fetch conversation and find new assistant message
 	async function findNewAssistantMessage(orgId, conversationId, responseUuid, requestSentTime, maxRetries = 2) {
 		for (let attempt = 0; attempt <= maxRetries; attempt++) {

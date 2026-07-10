@@ -2,294 +2,67 @@
 (function () {
 	'use strict';
 
-	//#region Streaming Playback Manager (Singleton)
-	class StreamingPlaybackManager {
-		constructor(onStateChange = null) {
-			this.state = 'idle';
-			// Session ID exists to invalidate all queued chunks at once when user hits stop
-			this.currentSessionId = null;
-			this.audioContext = null;
-			this.abortController = null;
-			this.activeSources = [];
-			this.scheduledEndTime = 0;
 
-			this.pendingQueue = [];
-			this.isProcessing = false;
-			this.isGenerating = false;
+	//#region PCM Helpers
+	// Native claude.ai TTS plays raw 16kHz mono s16le PCM. Providers stream PCM (ElevenLabs at
+	// 16kHz, OpenAI at 24kHz); we normalize everything to 16kHz mono and hand ArrayBuffers back.
 
-			this.completionPromise = null;
-			this.completionResolve = null;
-
-			this.onStateChange = onStateChange;
+	// Stateful linear resampler (s16 mono, srcRate -> dstRate) safe across streamed chunks.
+	class LinearResampler {
+		constructor(srcRate, dstRate) {
+			this.ratio = srcRate / dstRate;
+			this.pos = 0;   // fractional read position, carried into the next chunk's index space
+			this.prev = 0;  // last sample of the previous chunk, referenced at virtual index -1
 		}
 
-		changeState(newState, newProcessing = this.isProcessing) {
-			console.log(`State change: ${this.state} -> ${newState}, Processing: ${this.isProcessing} -> ${newProcessing}, is callback present: ${!!this.onStateChange}`);
-			this.state = newState;
-			this.isProcessing = newProcessing;
-			this.onStateChange?.(this.state, this.isProcessing);
-		}
-
-		queue(streamFactory) {
-			this.pendingQueue.push({
-				streamFactory: streamFactory,
-				sessionId: this.currentSessionId
-			});
-
-			if (!this.completionPromise) {
-				console.log('Creating new completion promise');
-				this.completionPromise = new Promise(resolve => {
-					this.completionResolve = resolve;
-				});
+		process(int16) {
+			if (int16.length === 0) return new Int16Array(0);
+			const out = [];
+			let t = this.pos;
+			while (true) {
+				const i0 = Math.floor(t);
+				const i1 = i0 + 1;
+				if (i1 >= int16.length) break; // need the next sample within this chunk
+				const s0 = i0 < 0 ? this.prev : int16[i0];
+				const s1 = int16[i1];
+				out.push((s0 + (s1 - s0) * (t - i0)) | 0);
+				t += this.ratio;
 			}
-
-			if (!this.isProcessing) {
-				this.processQueue();
-			}
-		}
-
-		async processQueue() {
-			this.changeState(this.state, true);
-
-			while (this.pendingQueue.length > 0 || this.isGenerating) {
-				if (!this.currentSessionId) {
-					this.pendingQueue = [];
-					break;
-				}
-
-				if (this.pendingQueue.length > 0 && !this.isGenerating) {
-					const next = this.pendingQueue.shift();
-
-					if (next.sessionId === this.currentSessionId) {
-						this.processStream(next.streamFactory, next.sessionId)
-							.catch(error => {
-								console.error('Stream processing error:', error);
-							});
-					}
-				}
-
-				await new Promise(r => setTimeout(r, 100));
-			}
-
-			// Wait for all scheduled audio to finish playing
-			if (this.currentSessionId && this.scheduledEndTime > 0) {
-				const remainingTime = this.scheduledEndTime - this.audioContext.currentTime;
-				if (remainingTime > 0) {
-					await new Promise(resolve => setTimeout(resolve, remainingTime * 1000 + 100));
-				}
-			}
-
-			this.changeState('idle', false);
-
-			if (this.completionResolve) {
-				this.completionResolve();
-				this.completionPromise = null;
-				this.completionResolve = null;
-			}
-		}
-
-		async waitForCompletion() {
-			if (this.completionPromise) {
-				return this.completionPromise;
-			}
-			return Promise.resolve();
-		}
-
-		async startSession() {
-			await this.stop();
-
-			const sessionId = Date.now() + '_' + Math.random();
-			this.currentSessionId = sessionId;
-
-			this.changeState('loading');
-
-			this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-
-			return sessionId;
-		}
-
-		async processStream(streamFactory, sessionId) {
-			this.isGenerating = true;
-			return new Promise(async (resolve, reject) => {
-				try {
-					if (this.currentSessionId !== sessionId) {
-						console.log(`[QOL-TTS Session ${sessionId}] Stream aborted before start`);
-						this.isGenerating = false;
-						resolve();
-						return;
-					}
-
-					this.abortController = new AbortController();
-
-					const reader = await streamFactory();
-
-					let nextStartTime = Math.max(
-						this.audioContext.currentTime + 0.1,
-						this.scheduledEndTime
-					);
-					let leftoverBytes = new Uint8Array(0);
-					let firstChunk = true;
-
-					while (true) {
-						if (this.currentSessionId !== sessionId) {
-							reader.cancel();
-							this.isGenerating = false;
-							resolve();
-							return;
-						}
-
-						const { done, value } = await reader.read();
-						if (done) {
-							this.isGenerating = false;
-							console.log(`[QOL-TTS Session ${sessionId}] Audio stream fully read`);
-							break;
-						}
-
-						if (firstChunk && this.state === 'loading') {
-							this.changeState('playing');
-							firstChunk = false;
-							console.log(`[QOL-TTS Session ${sessionId}] Audio started playing`);
-						}
-
-						const combinedData = new Uint8Array(leftoverBytes.length + value.length);
-						combinedData.set(leftoverBytes);
-						combinedData.set(value, leftoverBytes.length);
-
-						const completeSamples = Math.floor(combinedData.length / 2);
-						const bytesToProcess = completeSamples * 2;
-
-						if (completeSamples > 0) {
-							if (this.currentSessionId !== sessionId) {
-								reader.cancel();
-								this.isGenerating = false;
-								resolve();
-								return;
-							}
-
-							const pcmData = new Int16Array(combinedData.buffer, combinedData.byteOffset, completeSamples);
-
-							const audioBuffer = this.audioContext.createBuffer(1, pcmData.length, 24000);
-							const channelData = audioBuffer.getChannelData(0);
-							for (let i = 0; i < pcmData.length; i++) {
-								channelData[i] = pcmData[i] / 32768.0;
-							}
-
-							const source = this.audioContext.createBufferSource();
-							source.buffer = audioBuffer;
-							source.connect(this.audioContext.destination);
-
-							source.start(nextStartTime);
-							const endTime = nextStartTime + audioBuffer.duration;
-
-							this.registerSource(source, sessionId, endTime);
-
-							nextStartTime = endTime;
-							this.scheduledEndTime = Math.max(this.scheduledEndTime, endTime);
-						}
-
-						leftoverBytes = combinedData.slice(bytesToProcess);
-					}
-
-					resolve();
-
-				} catch (error) {
-					this.isGenerating = false;
-					if (error.name === 'AbortError') {
-						console.log(`[QOL-TTS Session ${sessionId}] Fetch aborted`);
-						resolve();
-					} else {
-						reject(error);
-					}
-				} finally {
-					console.log(`[QOL-TTS Session ${sessionId}] Stream processing completed or aborted`);
-				}
-			});
-		}
-
-		async stop() {
-			if (this.state === 'idle' && !this.isProcessing) {
-				return;
-			}
-
-			console.log('Stopping playback, state:', this.state);
-
-			this.changeState('stopping');
-
-			const oldSessionId = this.currentSessionId;
-			this.currentSessionId = null;
-
-			this.pendingQueue = [];
-
-			if (this.abortController) {
-				this.abortController.abort();
-				this.abortController = null;
-			}
-
-			const sourcesToStop = [...this.activeSources];
-			console.log(`Stopping ${sourcesToStop.length} active sources`);
-
-			for (const sourceInfo of sourcesToStop) {
-				if (!sourceInfo.stopped) {
-					try {
-						sourceInfo.source.stop(0);
-						sourceInfo.stopped = true;
-					} catch (e) {
-						console.log('Source already stopped:', e);
-					}
-				}
-			}
-
-			this.activeSources = [];
-			this.scheduledEndTime = 0;
-
-			if (this.completionResolve) {
-				this.completionResolve();
-				this.completionPromise = null;
-				this.completionResolve = null;
-			}
-
-			this.cleanupAudioContext();
-
-			this.changeState('idle', false);
-
-			console.log(`Playback stopped${oldSessionId ? ` (was session ${oldSessionId})` : ''}`);
-		}
-
-		registerSource(source, sessionId, endTime) {
-			const sourceInfo = {
-				source,
-				sessionId,
-				endTime,
-				stopped: false
-			};
-
-			this.activeSources.push(sourceInfo);
-
-			source.onended = () => {
-				sourceInfo.stopped = true;
-				this.activeSources = this.activeSources.filter(s => s !== sourceInfo);
-			};
-		}
-
-		cleanupAudioContext() {
-			if (this.audioContext) {
-				try {
-					if (this.audioContext.state !== 'closed') {
-						this.audioContext.close();
-					}
-				} catch (e) {
-					console.error('Error closing AudioContext:', e);
-				}
-				this.audioContext = null;
-			}
-		}
-
-		isActive() {
-			return this.state !== 'idle' || this.isProcessing;
+			this.pos = t - int16.length; // shift remainder into the next chunk's index space
+			this.prev = int16[int16.length - 1];
+			return Int16Array.from(out);
 		}
 	}
 
-	const streamingPlaybackManager = new StreamingPlaybackManager();
+	// Reads a provider's PCM stream, normalizes to 16kHz mono s16le, and emits ArrayBuffers via onChunk.
+	async function pumpReaderToPCM16(reader, srcRate, signal, onChunk) {
+		const resampler = srcRate === 16000 ? null : new LinearResampler(srcRate, 16000);
+		let leftover = new Uint8Array(0);
+		try {
+			while (true) {
+				if (signal?.aborted) { await reader.cancel().catch(() => {}); return; }
+				const { done, value } = await reader.read();
+				if (done) break;
+				const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+				const combined = new Uint8Array(leftover.length + chunk.length);
+				combined.set(leftover);
+				combined.set(chunk, leftover.length);
+				const nSamples = combined.length >> 1;
+				const usable = nSamples << 1;
+				leftover = combined.slice(usable); // 0 or 1 trailing byte across the boundary
+				if (nSamples === 0) continue;
+				if (resampler) {
+					const int16 = new Int16Array(combined.buffer, 0, nSamples);
+					const resampled = resampler.process(int16);
+					if (resampled.length) onChunk(resampled.buffer.slice(0, resampled.byteLength));
+				} else {
+					onChunk(combined.buffer.slice(0, usable));
+				}
+			}
+		} catch (e) {
+			if (e.name !== 'AbortError') throw e;
+		}
+	}
 	//#endregion
 
 	//#region Base Provider
@@ -314,32 +87,10 @@
 			throw new Error('attributeDialogueToCharacters must be implemented by provider');
 		}
 
-		async play(text, voice, model, apiKey) {
-			throw new Error('play must be implemented by provider');
-		}
-
-		async queue(text, voice, model, apiKey, extra = {}) {
-			throw new Error('queue must be implemented by provider');
-		}
-
-		async stop() {
-			throw new Error('stop must be implemented by provider');
-		}
-
-		isActive() {
-			throw new Error('isActive must be implemented by provider');
-		}
-
-		async startSession() {
-			throw new Error('startSession must be implemented by provider');
-		}
-
-		async waitForCompletion() {
-			throw new Error('waitForCompletion must be implemented by provider');
-		}
-
-		getCurrentSessionId() {
-			throw new Error('getCurrentSessionId must be implemented by provider');
+		// Produce 16kHz mono s16le PCM for `text`, invoking onChunk(ArrayBuffer) as audio is generated.
+		// `signal` (AbortSignal) cancels in-flight generation.
+		async synthesize(text, voice, model, apiKey, extra, signal, onChunk) {
+			throw new Error('synthesize must be implemented by provider');
 		}
 	}
 	//#endregion
@@ -349,9 +100,6 @@
 		constructor(onStateChange = null) {
 			super(onStateChange);
 			this.modelCharLimits = {};
-			if (onStateChange) {
-				streamingPlaybackManager.onStateChange = onStateChange;
-			}
 		}
 
 		async fetchModelCharLimits(apiKey) {
@@ -553,8 +301,8 @@ JSON array:`;
 			});
 		}
 
-		async streamText(text, voiceId, modelId, apiKey, extra = {}) {
-			const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=pcm_24000`;
+		async streamText(text, voiceId, modelId, apiKey, signal) {
+			const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=pcm_16000`;
 			const response = await fetch(url, {
 				method: 'POST',
 				headers: {
@@ -566,7 +314,7 @@ JSON array:`;
 					model_id: modelId,
 					apply_text_normalization: (modelId.includes("turbo") || modelId.includes("flash")) ? "off" : "on"
 				}),
-				signal: streamingPlaybackManager.abortController?.signal
+				signal: signal
 			});
 
 			if (!response.ok) {
@@ -620,53 +368,16 @@ JSON array:`;
 			return chunks;
 		}
 
-		async play(text, voice, model, apiKey) {
-			await streamingPlaybackManager.startSession();
-
+		async synthesize(text, voice, model, apiKey, extra, signal, onChunk) {
 			await this.fetchModelCharLimits(apiKey);
 			const maxChars = this.modelCharLimits[model] ?? 4900; // Default to 4900 if limit not found
 			const chunks = this.chunkText(text, maxChars);
 
 			for (const chunk of chunks) {
-				streamingPlaybackManager.queue(
-					async () => this.streamText(chunk, voice, model, apiKey)
-				);
+				if (signal?.aborted) return;
+				const reader = await this.streamText(chunk, voice, model, apiKey, signal);
+				await pumpReaderToPCM16(reader, 16000, signal, onChunk); // ElevenLabs already at 16kHz
 			}
-
-			await streamingPlaybackManager.waitForCompletion();
-			console.log('Playback completed');
-		}
-
-		async queue(text, voice, model, apiKey, extra = {}) {
-			await this.fetchModelCharLimits(apiKey);
-			const maxChars = this.modelCharLimits[model] ?? 4900; // Default to 4900 if limit not found
-			const chunks = this.chunkText(text, maxChars);
-
-			for (const chunk of chunks) {
-				streamingPlaybackManager.queue(
-					async () => this.streamText(chunk, voice, model, apiKey, extra)
-				);
-			}
-		}
-
-		async stop() {
-			await streamingPlaybackManager.stop();
-		}
-
-		isActive() {
-			return streamingPlaybackManager.isActive();
-		}
-
-		async startSession() {
-			return await streamingPlaybackManager.startSession();
-		}
-
-		async waitForCompletion() {
-			return streamingPlaybackManager.waitForCompletion();
-		}
-
-		getCurrentSessionId() {
-			return streamingPlaybackManager.currentSessionId;
 		}
 	}
 	//#endregion
@@ -677,9 +388,6 @@ JSON array:`;
 
 		constructor(onStateChange = null) {
 			super(onStateChange);
-			if (onStateChange) {
-				streamingPlaybackManager.onStateChange = onStateChange;
-			}
 		}
 
 		async getVoices(apiKey) {
@@ -808,7 +516,7 @@ JSON array:`;
 					'Authorization': `Bearer ${apiKey}`,
 				},
 				body: JSON.stringify(body),
-				signal: streamingPlaybackManager.abortController?.signal
+				signal: extra.signal
 			});
 
 			if (!response.ok) {
@@ -862,258 +570,28 @@ JSON array:`;
 			return chunks;
 		}
 
-		async play(text, voice, model, apiKey, baseUrl = '') {
-			await streamingPlaybackManager.startSession();
-
+		async synthesize(text, voice, model, apiKey, extra, signal, onChunk) {
 			const chunks = this.chunkText(text, 4096);
 
 			for (const chunk of chunks) {
-				streamingPlaybackManager.queue(
-					async () => this.streamText(chunk, voice, model, apiKey, { baseUrl })
-				);
+				if (signal?.aborted) return;
+				const reader = await this.streamText(chunk, voice, model, apiKey, { ...extra, signal });
+				await pumpReaderToPCM16(reader, 24000, signal, onChunk); // OpenAI PCM is 24kHz -> resample
 			}
-
-			await streamingPlaybackManager.waitForCompletion();
-			console.log('Playback completed');
-		}
-
-		async queue(text, voice, model, apiKey, extra = {}) {
-			const chunks = this.chunkText(text, 4096);
-
-			for (const chunk of chunks) {
-				streamingPlaybackManager.queue(
-					async () => this.streamText(chunk, voice, model, apiKey, extra)
-				);
-			}
-		}
-
-		async stop() {
-			await streamingPlaybackManager.stop();
-		}
-
-		isActive() {
-			return streamingPlaybackManager.isActive();
-		}
-
-		async startSession() {
-			return await streamingPlaybackManager.startSession();
-		}
-
-		async waitForCompletion() {
-			return streamingPlaybackManager.waitForCompletion();
-		}
-
-		getCurrentSessionId() {
-			return streamingPlaybackManager.currentSessionId;
 		}
 	}
 	//#endregion
 
-	//#region Browser TTS Provider
-	class BrowserTTSProvider extends Provider {
-		constructor(onStateChange = null) {
-			super(onStateChange);
-			this.synth = window.speechSynthesis;
-			this.state = 'idle';
-			this.isProcessing = false;
-			this.onStateChange = onStateChange;
-			this.utteranceQueue = [];
-			this.currentSessionId = null;
-		}
-
-		changeState(newState, newProcessing = this.isProcessing) {
-			this.state = newState;
-			this.isProcessing = newProcessing;
-			this.onStateChange?.(this.state, this.isProcessing);
-		}
-
-		async getVoices(apiKey) {
-			// Browser voices load asynchronously, might need to wait
-			let voices = this.synth.getVoices();
-
-			if (voices.length === 0) {
-				// Wait for voices to load
-				await new Promise(resolve => {
-					this.synth.addEventListener('voiceschanged', resolve, { once: true });
-					setTimeout(resolve, 1000); // Timeout fallback
-				});
-				voices = this.synth.getVoices();
-			}
-
-			return voices.map(v => ({
-				voice_id: v.voiceURI,
-				name: `${v.name} (${v.lang})`
-			}));
-		}
-
-		async getModels(apiKey) {
-			return [
-				{ model_id: 'browser', name: 'Browser TTS', can_do_text_to_speech: true }
-			];
-		}
-
-		async testApiKey(apiKey) {
-			return true; // No API key needed
-		}
-
-		async attributeDialogueToCharacters(text, characters) {
-			// Basic attribution via Claude
-			return new Promise((resolve, reject) => {
-				const requestId = Math.random().toString(36).substr(2, 9);
-
-				const listener = (event) => {
-					if (event.data.type === 'tts-analyze-dialogue-response' &&
-						event.data.requestId === requestId) {
-						window.removeEventListener('message', listener);
-
-						if (event.data.success) {
-							const segments = event.data.data.map(seg => ({
-								...seg,
-								extra: {}
-							}));
-							resolve(segments);
-						} else {
-							reject(new Error(event.data.error));
-						}
-					}
-				};
-
-				window.addEventListener('message', listener);
-
-				window.postMessage({
-					type: 'tts-analyze-dialogue-request',
-					text: text,
-					characters: characters,
-					requestId: requestId
-				}, '*');
-
-				setTimeout(() => {
-					window.removeEventListener('message', listener);
-					reject(new Error('Dialogue analysis timed out'));
-				}, 30000);
-			});
-		}
-
-		async speak(text, voiceId, extra = {}) {
-			return new Promise((resolve, reject) => {
-				const sessionId = this.currentSessionId;
-
-				const utterance = new SpeechSynthesisUtterance(text);
-
-				// Find and set voice
-				const voices = this.synth.getVoices();
-				const voice = voices.find(v => v.voiceURI === voiceId);
-				if (voice) {
-					utterance.voice = voice;
-				}
-
-				utterance.onstart = () => {
-					if (this.state === 'loading') {
-						this.changeState('playing');
-					}
-				};
-
-				utterance.onend = () => {
-					// Check if session is still valid
-					if (this.currentSessionId === sessionId) {
-						resolve();
-					}
-				};
-
-				utterance.onerror = (event) => {
-					console.error('Speech synthesis error:', event);
-					reject(event.error);
-				};
-
-				// Check session before speaking
-				if (this.currentSessionId !== sessionId) {
-					resolve(); // Session cancelled
-					return;
-				}
-
-				this.synth.speak(utterance);
-			});
-		}
-
-		async play(text, voice, model, apiKey) {
-			await this.startSession();
-			await this.speak(text, voice);
-			this.changeState('idle', false);
-		}
-
-		async queue(text, voice, model, apiKey, extra = {}) {
-			this.utteranceQueue.push({ text, voice, extra, sessionId: this.currentSessionId });
-
-			if (!this.isProcessing) {
-				this.processQueue();
-			}
-		}
-
-		async processQueue() {
-			this.changeState(this.state, true);
-
-			while (this.utteranceQueue.length > 0) {
-				if (!this.currentSessionId) {
-					this.utteranceQueue = [];
-					break;
-				}
-
-				const next = this.utteranceQueue.shift();
-
-				if (next.sessionId === this.currentSessionId) {
-					try {
-						await this.speak(next.text, next.voice, next.extra);
-					} catch (error) {
-						console.error('Speech error:', error);
-					}
-				}
-			}
-
-			this.changeState('idle', false);
-		}
-
-		async stop() {
-			if (this.state === 'idle' && !this.isProcessing) {
-				return;
-			}
-
-			console.log('Stopping browser TTS');
-
-			this.changeState('stopping');
-			this.currentSessionId = null;
-			this.utteranceQueue = [];
-			this.synth.cancel();
-			this.changeState('idle', false);
-		}
-
-		isActive() {
-			return this.state !== 'idle' || this.isProcessing || this.synth.speaking;
-		}
-
-		async startSession() {
-			await this.stop();
-			const sessionId = Date.now() + '_' + Math.random();
-			this.currentSessionId = sessionId;
-			this.changeState('loading');
-			return sessionId;
-		}
-
-		async waitForCompletion() {
-			// Wait for queue to empty and synth to finish
-			while (this.utteranceQueue.length > 0 || this.synth.speaking) {
-				await new Promise(resolve => setTimeout(resolve, 100));
-			}
-		}
-
-		getCurrentSessionId() {
-			return this.currentSessionId;
-		}
-	}
-	//#endregion
 
 	// Export to window for use by main script
 	window.TTSProviders = {
 		TTS_PROVIDERS: {
+			claude: {
+				name: 'Claude (built-in)',
+				requiresApiKey: false,
+				native: true, // passthrough: let claude.ai's own TTS play, no hijack
+				class: null
+			},
 			elevenlabs: {
 				name: 'ElevenLabs',
 				requiresApiKey: true,
@@ -1123,11 +601,6 @@ JSON array:`;
 				name: 'OpenAI',
 				requiresApiKey: true,
 				class: OpenAIProvider
-			},
-			browser: {
-				name: 'Browser (Free)',
-				requiresApiKey: false,
-				class: BrowserTTSProvider
 			}
 		}
 	};

@@ -10,8 +10,8 @@
 
 const SETTINGS_KEYS = {
 	TTS: {
-		ENABLED: { key: 'tts_enabled', default: false, type: 'boolean' },
-		PROVIDER: { key: 'tts_provider', default: 'elevenlabs', type: 'string' },
+		ENABLED: { key: 'tts_enabled', default: false, type: 'boolean' }, // legacy; migrated to PROVIDER='claude'
+		PROVIDER: { key: 'tts_provider', default: 'claude', type: 'string' }, // 'claude' = native passthrough (no hijack)
 		API_KEY: { key: 'tts_apiKey', default: '', type: 'string' },
 		VOICE: { key: 'tts_voice', default: '', type: 'string' },
 		MODEL: { key: 'tts_model', default: 'eleven_flash_v2_5', type: 'string' },

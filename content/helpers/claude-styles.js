@@ -78,6 +78,11 @@ class ClaudeModal {
 		this.modal.className = CLAUDE_CLASSES.MODAL_CONTAINER;
 		this.modal.setAttribute('role', 'dialog');
 		this.modal.setAttribute('aria-modal', 'true');
+		// Cap height and lay out as a column so a tall body scrolls instead of overflowing the viewport.
+		// (Inline styles rather than Tailwind arbitrary-value classes, which may not exist in claude.ai's CSS.)
+		this.modal.style.maxHeight = '90vh';
+		this.modal.style.display = 'flex';
+		this.modal.style.flexDirection = 'column';
 
 		this.titleElement = document.createElement('h2');
 		this.titleElement.id = 'modal-title';
@@ -88,6 +93,10 @@ class ClaudeModal {
 
 		this.contentDiv = document.createElement('div');
 		this.contentDiv.className = 'mb-4';
+		// Only the body scrolls; title and buttons stay pinned. min-height:0 lets the flex child shrink.
+		this.contentDiv.style.flex = '1 1 auto';
+		this.contentDiv.style.minHeight = '0';
+		this.contentDiv.style.overflowY = 'auto';
 		this._setContent(this.config.content);
 		this.modal.appendChild(this.contentDiv);
 
@@ -1669,7 +1678,6 @@ function getUIMessages() {
 // Callers register once; MessageButtonBar handles polling, injection, and ordering.
 const MessageButtonBar = {
 	ASSISTANT_BUTTON_PRIORITY: [
-		'tts-speak-button',
 		'fork-button',
 		'bookmark-button',
 	],
