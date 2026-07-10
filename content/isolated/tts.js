@@ -331,6 +331,13 @@
 			voiceSelect.id = 'voiceSelect';
 			voiceSelect.disabled = currentProviderInfo.requiresApiKey && !settings.apiKey;
 			voiceSection.appendChild(voiceSelect);
+			// ElevenLabs applies each voice's last-used generation settings (we don't send voice_settings).
+			const elevenVoiceHint = document.createElement('p');
+			elevenVoiceHint.id = 'elevenVoiceHint';
+			elevenVoiceHint.className = 'text-text-500 text-xs mt-1';
+			elevenVoiceHint.textContent = 'Uses this voice’s last-used settings (stability, style, speed…) — adjust them on the ElevenLabs playground at elevenlabs.io.';
+			elevenVoiceHint.style.display = settings.provider === 'elevenlabs' ? 'block' : 'none';
+			voiceSection.appendChild(elevenVoiceHint);
 			content.appendChild(voiceSection);
 
 			// Model select
@@ -554,6 +561,7 @@
 				apiKeySection.style.display = (!native && newProviderInfo.requiresApiKey) ? 'block' : 'none';
 				baseUrlSection.style.display = (!native && newProviderKey === 'openai') ? 'block' : 'none';
 				voiceSection.style.display = native ? 'none' : 'block';
+				elevenVoiceHint.style.display = (newProviderKey === 'elevenlabs') ? 'block' : 'none';
 
 				// Swap between the model dropdown and the custom-model input (both hidden when native)
 				const custom = useCustomModel(newProviderKey, baseUrlInput.value);
