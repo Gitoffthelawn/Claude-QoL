@@ -1,2 +1,1 @@
-Added copying exports to clipboard
-Added mid-stream image injection to make it more responsive
+Improved laggy responses caused by the image injection even when no images are present

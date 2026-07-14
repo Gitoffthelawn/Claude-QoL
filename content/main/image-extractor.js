@@ -53,6 +53,58 @@ function getImageDimensions(fileUuid, url) {
 	});
 }
 
+// Named aspect-ratio presets some image tools expose instead of raw pixel dimensions.
+// We only use dims to set the gallery's aspect (width is always scaled to 3840), so a
+// ratio is enough. Add more names/ratios here as other tools turn up in the logs.
+const _ASPECT_PRESETS = {
+	square: [1, 1],
+	portrait: [3, 4],
+	landscape: [4, 3],
+	tall: [9, 16],
+	wide: [16, 9]
+};
+
+// Turn an aspect_ratio value into a {width,height} carrying the right ratio. Handles named
+// presets ("wide"), "W:H"/"WxH"/"W/H" strings ("16:9"), and a numeric ratio (1.777).
+function aspectRatioToDims(val) {
+	if (val == null) return null;
+	if (typeof val === 'number' && val > 0) return { width: Math.round(val * 1000), height: 1000 };
+	if (typeof val !== 'string') return null;
+	const key = val.trim().toLowerCase();
+	if (_ASPECT_PRESETS[key]) {
+		const [w, h] = _ASPECT_PRESETS[key];
+		return { width: w, height: h };
+	}
+	const m = key.match(/^(\d+(?:\.\d+)?)\s*[:x/]\s*(\d+(?:\.\d+)?)$/);
+	if (m) {
+		const w = parseFloat(m[1]), h = parseFloat(m[2]);
+		if (w > 0 && h > 0) return { width: w, height: h };
+	}
+	return null;
+}
+
+// Try to read image dimensions directly out of stream data — the image content item itself
+// or the generating tool_use input (image tools pass either raw width/height, or a named
+// aspect_ratio like "wide"). Returns null if nothing usable is found, so callers fall back
+// to the network measure. Non-aspect field names are guesses covering common tool shapes.
+function extractDimsFromStream(imageItem, toolInput) {
+	const tryPair = (w, h) => (w > 0 && h > 0) ? { width: Math.round(w), height: Math.round(h) } : null;
+	imageItem = imageItem || {};
+	toolInput = toolInput || {};
+	return (
+		tryPair(imageItem.width, imageItem.height) ||
+		tryPair(imageItem.image_width, imageItem.image_height) ||
+		tryPair(imageItem.preview_asset?.image_width, imageItem.preview_asset?.image_height) ||
+		tryPair(imageItem.asset?.image_width, imageItem.asset?.image_height) ||
+		tryPair(imageItem.dimensions?.width, imageItem.dimensions?.height) ||
+		tryPair(toolInput.width, toolInput.height) ||
+		tryPair(toolInput.image_width, toolInput.image_height) ||
+		aspectRatioToDims(toolInput.aspect_ratio) ||
+		aspectRatioToDims(imageItem.aspect_ratio) ||
+		null
+	);
+}
+
 // ==== LIVE SSE INJECTION ====
 // During a streaming completion, MCP/ComfyUI image tools stream back as a bare
 // tool_result content block (content: [{type:"image", file_uuid}, ...]) which the
@@ -64,7 +116,6 @@ function getImageDimensions(fileUuid, url) {
 // per injection. This is purely a live/visual upgrade; on reload the load-time path
 // re-injects from the conversation JSON (with real measured dimensions).
 function createImageInjectingStream(sourceBody, orgId) {
-	const reader = sourceBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
 
@@ -82,7 +133,7 @@ function createImageInjectingStream(sourceBody, orgId) {
 		return rawEvent.replace(/"index":(\d+)/, (m, n) => `"index":${parseInt(n, 10) + indexOffset}`);
 	};
 
-	const buildInjectedEvents = async (toolResultNativeIndex, images, prompt) => {
+	const buildInjectedEvents = async (toolResultNativeIndex, images, prompt, toolInput = {}) => {
 		const outIndex = toolResultNativeIndex + indexOffset; // output index of the native tool_result we just emitted
 		const toolUseIndex = outIndex + 1;
 		const toolResultIndex = outIndex + 2;
@@ -92,10 +143,22 @@ function createImageInjectingStream(sourceBody, orgId) {
 		// Measure each preview (same helper + shared localStorage cache the load-time path
 		// uses) so the gallery renders at the correct aspect immediately — no flash — and
 		// so the later reload is instant. Width is scaled to 3840 so it renders full-width,
-		// matching the load-time injector.
+		// matching the load-time injector. Awaiting here pauses the stream while measuring;
+		// because we now pipe through a TransformStream, that await backpressures the source
+		// correctly and only stalls around an image result, not general text streaming.
 		const galleryImages = await Promise.all(images.map(async (c) => {
 			const imageUrl = `https://claude.ai/api/${orgId}/files/${c.file_uuid}/preview`;
-			const dims = await getImageDimensions(c.file_uuid, imageUrl);
+			// Prefer dimensions carried in the stream (image item or generating tool_use input);
+			// only fall back to the network measure when the stream doesn't provide them.
+			let dims = extractDimsFromStream(c, toolInput);
+			if (dims) {
+				// Stream dims are aspect-only (e.g. 16:9); still measure the real preview in the
+				// background (fire-and-forget) to warm the shared cache so the load-time path
+				// re-injects at true pixel dimensions on the next reload.
+				getImageDimensions(c.file_uuid, imageUrl).catch(() => {});
+			} else {
+				dims = await getImageDimensions(c.file_uuid, imageUrl);
+			}
 			const scale = 3840 / dims.width;
 			const scaledW = Math.round(dims.width * scale);
 			const scaledH = Math.round(dims.height * scale);
@@ -172,6 +235,10 @@ function createImageInjectingStream(sourceBody, orgId) {
 		];
 	};
 
+	// NOTE: this runs inside a TransformStream.transform(); a thrown error here would error
+	// the whole stream and break Claude's response. The native event is always forwarded
+	// first, and the injection logic below is wrapped so an unexpected failure can never
+	// stop the native stream from flowing.
 	const handleEvent = async (controller, rawEvent) => {
 		if (!rawEvent.trim()) return;
 
@@ -184,65 +251,61 @@ function createImageInjectingStream(sourceBody, orgId) {
 
 		if (!parsed || typeof parsed.index !== 'number') return;
 
-		// Accumulate the preceding tool_use's streamed input so we can recover its prompt.
-		if (parsed.type === 'content_block_start' && parsed.content_block?.type === 'tool_use') {
-			toolUseInputBuf.set(parsed.index, '');
-		} else if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'input_json_delta' && toolUseInputBuf.has(parsed.index)) {
-			toolUseInputBuf.set(parsed.index, toolUseInputBuf.get(parsed.index) + (parsed.delta.partial_json || ''));
-		} else if (parsed.type === 'content_block_stop' && toolUseInputBuf.has(parsed.index)) {
-			try { toolUseParsed.set(parsed.index, JSON.parse(toolUseInputBuf.get(parsed.index) || '{}')); } catch (e) {}
-			toolUseInputBuf.delete(parsed.index);
-		}
+		try {
+			// Accumulate the preceding tool_use's streamed input so we can recover its prompt.
+			if (parsed.type === 'content_block_start' && parsed.content_block?.type === 'tool_use') {
+				toolUseInputBuf.set(parsed.index, '');
+			} else if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'input_json_delta' && toolUseInputBuf.has(parsed.index)) {
+				toolUseInputBuf.set(parsed.index, toolUseInputBuf.get(parsed.index) + (parsed.delta.partial_json || ''));
+			} else if (parsed.type === 'content_block_stop' && toolUseInputBuf.has(parsed.index)) {
+				try { toolUseParsed.set(parsed.index, JSON.parse(toolUseInputBuf.get(parsed.index) || '{}')); } catch (e) {}
+				toolUseInputBuf.delete(parsed.index);
+			}
 
-		// Detect a bare-image tool_result (ComfyUI/MCP). Native image_search results carry
-		// an image_gallery instead of bare image items, so they never match.
-		if (parsed.type === 'content_block_start' && parsed.content_block?.type === 'tool_result') {
-			const images = (parsed.content_block.content || []).filter((c) => c.type === 'image' && c.file_uuid);
-			if (images.length > 0 && orgId) pendingInjections.set(parsed.index, images);
-		}
+			// Detect a bare-image tool_result (ComfyUI/MCP). Native image_search results carry
+			// an image_gallery instead of bare image items, so they never match.
+			if (parsed.type === 'content_block_start' && parsed.content_block?.type === 'tool_result') {
+				const images = (parsed.content_block.content || []).filter((c) => c.type === 'image' && c.file_uuid);
+				if (images.length > 0 && orgId) pendingInjections.set(parsed.index, images);
+			}
 
-		// The tool_result start is immediately followed by its stop; inject right after it.
-		if (parsed.type === 'content_block_stop' && pendingInjections.has(parsed.index)) {
-			const images = pendingInjections.get(parsed.index);
-			pendingInjections.delete(parsed.index);
-			const prompt = toolUseParsed.get(parsed.index - 1)?.prompt || '';
-			for (const ev of await buildInjectedEvents(parsed.index, images, prompt)) emit(controller, ev);
-			indexOffset += 2;
+			// The tool_result start is immediately followed by its stop; inject right after it.
+			if (parsed.type === 'content_block_stop' && pendingInjections.has(parsed.index)) {
+				const images = pendingInjections.get(parsed.index);
+				pendingInjections.delete(parsed.index);
+				const toolInput = toolUseParsed.get(parsed.index - 1) || {};
+				const prompt = toolInput.prompt || '';
+				for (const ev of await buildInjectedEvents(parsed.index, images, prompt, toolInput)) emit(controller, ev);
+				indexOffset += 2;
+			}
+		} catch (e) {
+			// Injection is best-effort; never let it break the native stream.
+			console.error('[QOL-ImageExtractor] injection error (native stream unaffected):', e);
 		}
 	};
 
-	return new ReadableStream({
-		async pull(controller) {
-			while (true) {
-				let result;
-				try {
-					result = await reader.read();
-				} catch (e) {
-					controller.error(e);
-					return;
-				}
-				const { done, value } = result;
-				if (done) {
-					if (buffer.trim()) await handleEvent(controller, buffer);
-					controller.close();
-					return;
-				}
-				buffer += decoder.decode(value, { stream: true });
-				let emitted = false;
-				let boundary;
-				while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-					const rawEvent = buffer.slice(0, boundary);
-					buffer = buffer.slice(boundary + 2);
-					await handleEvent(controller, rawEvent);
-					emitted = true;
-				}
-				if (emitted) return; // yield back to consumer after producing output
+	// Pipe the source body through a platform TransformStream rather than a hand-rolled
+	// ReadableStream pull loop. The browser then drives read/enqueue pacing and backpressure
+	// natively (as with any fetch → *Stream → consumer chain), so non-image events pass
+	// through with native timing instead of being clustered into bursts by a JS watermark
+	// loop. Error and cancel propagation are handled by pipeThrough automatically.
+	const transform = new TransformStream({
+		async transform(chunk, controller) {
+			buffer += decoder.decode(chunk, { stream: true });
+			let boundary;
+			while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+				const rawEvent = buffer.slice(0, boundary);
+				buffer = buffer.slice(boundary + 2);
+				await handleEvent(controller, rawEvent);
 			}
 		},
-		cancel(reason) {
-			try { reader.cancel(reason); } catch (e) {}
+		async flush(controller) {
+			buffer += decoder.decode();
+			if (buffer.trim()) await handleEvent(controller, buffer);
 		}
 	});
+
+	return sourceBody.pipeThrough(transform);
 }
 
 // ==== FETCH INTERCEPTION — inject test markers into tool_use/thinking near image results ====
@@ -420,9 +483,6 @@ window.fetch = async (...args) => {
 					}
 				}
 
-				if (insertions.length > 0) {
-					console.log('[QOL-ImageExtractor] Final content array for message', msg.uuid, JSON.parse(JSON.stringify(content)));
-				}
 			}
 		}
 
@@ -463,7 +523,6 @@ window.fetch = async (...args) => {
 	function appendStyle() {
 		if (document.head) {
 			document.head.appendChild(style);
-			console.log('[QOL-ImageExtractor] Injected custom styles for tool result images.');
 		} else {
 			document.addEventListener('DOMContentLoaded', () => document.head.appendChild(style));
 		}
