@@ -24,6 +24,44 @@ function _persistImageDims() {
 	} catch (e) { /* quota or serialization issue — non-fatal */ }
 }
 
+// ==== Conversations with generated images ====
+// The live /completion wrapper is only installed for conversations known to contain
+// generated images — flagged here by the load-time path when it finds bare-image
+// tool_results. Re-piping the completion stream in JS causes visible streaming jank on
+// some machines (root cause under investigation; see inject-stream-test.js), so every
+// other conversation gets the native stream untouched. Tradeoff: a conversation's FIRST
+// image only gets its gallery on reload, which also flags the conversation so later
+// generations inject live.
+const _IMG_CONVS_KEY = 'claude_qol_image_convs';
+
+function _loadImageConvs() {
+	try {
+		const raw = localStorage.getItem(_IMG_CONVS_KEY);
+		return raw ? JSON.parse(raw) : {};
+	} catch (e) { return {}; }
+}
+
+function _conversationHasImages(convId) {
+	if (!convId) return false;
+	return !!_loadImageConvs()[convId];
+}
+
+function _markConversationHasImages(convId) {
+	if (!convId) return;
+	try {
+		const map = _loadImageConvs();
+		if (map[convId]) return;
+		map[convId] = true;
+		localStorage.setItem(_IMG_CONVS_KEY, JSON.stringify(map));
+	} catch (e) { /* quota or serialization issue — non-fatal */ }
+}
+
+// Conversation ID from an API URL (covers /completion, /retry_completion, and the
+// rendering_mode=messages conversation fetch).
+function _convIdFromUrl(url) {
+	return url.match(/chat_conversations\/([0-9a-f-]{8,})/)?.[1] || null;
+}
+
 function getImageDimensions(fileUuid, url) {
 	const cached = _imageDimsCache.get(fileUuid);
 	if (cached) return Promise.resolve(cached);
@@ -105,6 +143,14 @@ function extractDimsFromStream(imageItem, toolInput) {
 	);
 }
 
+// ==== DIAGNOSTICS ====
+// Timing logs to pinpoint streaming stalls (our blocking measure, our injection build, or
+// upstream). ON by default while diagnosing; disable with localStorage['claude_qol_img_diag']='0'.
+function _imgDiagOn() {
+	try { return localStorage.getItem('claude_qol_img_diag') !== '0'; } catch (e) { return true; }
+}
+function _diag(...a) { if (_imgDiagOn()) { try { console.log('[QOL-DIAG]', ...a); } catch (e) {} } }
+
 // ==== LIVE SSE INJECTION ====
 // During a streaming completion, MCP/ComfyUI image tools stream back as a bare
 // tool_result content block (content: [{type:"image", file_uuid}, ...]) which the
@@ -124,6 +170,12 @@ function createImageInjectingStream(sourceBody, orgId) {
 	const toolUseInputBuf = new Map();   // nativeIndex -> accumulated input_json_delta string
 	const toolUseParsed = new Map();     // nativeIndex -> parsed tool_use input object
 	const pendingInjections = new Map(); // tool_result nativeIndex -> [image items]
+
+	// Diagnostics: stream clock + inter-event gap tracking to catch stalls.
+	const _streamStart = performance.now();
+	let _lastEventAt = _streamStart;
+	let _evtCount = 0;
+	_diag(`stream opened @${new Date().toISOString()}`);
 
 	const emit = (controller, text) => controller.enqueue(encoder.encode(text + '\n\n'));
 
@@ -152,12 +204,15 @@ function createImageInjectingStream(sourceBody, orgId) {
 			// only fall back to the network measure when the stream doesn't provide them.
 			let dims = extractDimsFromStream(c, toolInput);
 			if (dims) {
+				_diag(`dims from STREAM for ${c.file_uuid}`, dims);
 				// Stream dims are aspect-only (e.g. 16:9); still measure the real preview in the
 				// background (fire-and-forget) to warm the shared cache so the load-time path
 				// re-injects at true pixel dimensions on the next reload.
 				getImageDimensions(c.file_uuid, imageUrl).catch(() => {});
 			} else {
+				const _t0 = performance.now();
 				dims = await getImageDimensions(c.file_uuid, imageUrl);
+				_diag(`dims MEASURED (network, BLOCKING) for ${c.file_uuid} took ${Math.round(performance.now() - _t0)}ms`, dims);
 			}
 			const scale = 3840 / dims.width;
 			const scaledW = Math.round(dims.width * scale);
@@ -249,6 +304,15 @@ function createImageInjectingStream(sourceBody, orgId) {
 		// Forward the native event first, with any accumulated index offset applied.
 		emit(controller, applyOffset(rawEvent));
 
+		// Diagnostics: flag stalls in the event flow (gap since previous event reached us).
+		if (_imgDiagOn()) {
+			const _now = performance.now();
+			const _gap = _now - _lastEventAt;
+			_lastEventAt = _now;
+			_evtCount++;
+			if (_gap > 150) _diag(`+${Math.round(_gap)}ms GAP before event #${_evtCount} (${parsed?.type || 'non-json'} @${parsed?.index ?? '-'})`);
+		}
+
 		if (!parsed || typeof parsed.index !== 'number') return;
 
 		try {
@@ -275,7 +339,14 @@ function createImageInjectingStream(sourceBody, orgId) {
 				pendingInjections.delete(parsed.index);
 				const toolInput = toolUseParsed.get(parsed.index - 1) || {};
 				const prompt = toolInput.prompt || '';
-				for (const ev of await buildInjectedEvents(parsed.index, images, prompt, toolInput)) emit(controller, ev);
+				if (_imgDiagOn()) {
+					_diag(`>>> injecting ${images.length} image(s) @index ${parsed.index}; toolInput keys=`, Object.keys(toolInput), 'aspect_ratio=', toolInput.aspect_ratio, 'w/h=', toolInput.width, toolInput.height);
+					images.forEach((c, i) => _diag(`    image[${i}] keys=`, Object.keys(c), c));
+				}
+				const _tb = performance.now();
+				const _evs = await buildInjectedEvents(parsed.index, images, prompt, toolInput);
+				_diag(`<<< buildInjectedEvents took ${Math.round(performance.now() - _tb)}ms (blocks the stream this long)`);
+				for (const ev of _evs) emit(controller, ev);
 				indexOffset += 2;
 			}
 		} catch (e) {
@@ -284,31 +355,89 @@ function createImageInjectingStream(sourceBody, orgId) {
 		}
 	};
 
-	// Pipe the source body through a platform TransformStream rather than a hand-rolled
-	// ReadableStream pull loop. The browser then drives read/enqueue pacing and backpressure
-	// natively (as with any fetch → *Stream → consumer chain), so non-image events pass
-	// through with native timing instead of being clustered into bursts by a JS watermark
-	// loop. Error and cancel propagation are handled by pipeThrough automatically.
-	const transform = new TransformStream({
-		async transform(chunk, controller) {
-			buffer += decoder.decode(chunk, { stream: true });
-			let boundary;
-			while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-				const rawEvent = buffer.slice(0, boundary);
-				buffer = buffer.slice(boundary + 2);
-				await handleEvent(controller, rawEvent);
-			}
+	// Drain the source with an EAGER background pump rather than a lazy pull loop / pipeThrough.
+	// The root problem with a JS stream wrapper: WE become the socket reader, and if we only read
+	// when the consumer pulls us (as both the old pull-loop and a TransformStream/pipeThrough do),
+	// any pause in Claude's renderer back-propagates through us, stops us reading the socket, TCP
+	// flow-control kicks in, and the SERVER pauses sending — data then arrives in multi-second
+	// bursts. The native fetch body avoids this by draining the socket eagerly in C++ and buffering
+	// ahead of a slow reader. We replicate that here: a background pump in start() reads the source
+	// as fast as it arrives and enqueues into our own (unbounded) buffer, so network delivery is
+	// fully decoupled from the renderer's read cadence. The consumer then drains our buffer at will.
+	const reader = sourceBody.getReader();
+	let _cancelled = false;
+	let _lastRead = _streamStart;
+	let _chunkNo = 0;
+	let _maxAhead = 0;
+
+	return new ReadableStream({
+		start(controller) {
+			// Detached async pump — NOT returned, so the stream is "started" immediately and the
+			// pump runs independently of the consumer (this is what makes reading eager).
+			(async () => {
+				try {
+					while (!_cancelled) {
+						const { done, value } = await reader.read();
+						if (done) {
+							buffer += decoder.decode();
+							if (buffer.trim()) await handleEvent(controller, buffer);
+							_diag(`stream done: ${_evtCount} events, ${_chunkNo} chunks, ${Math.round(performance.now() - _streamStart)}ms, maxQueuedAhead=${_maxAhead}`);
+							controller.close();
+							return;
+						}
+						const _bytes = value.byteLength;
+						const _gap = performance.now() - _lastRead;
+						const _p0 = performance.now();
+						_chunkNo++;
+						buffer += decoder.decode(value, { stream: true });
+						let boundary;
+						let _n = 0;
+						while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+							const rawEvent = buffer.slice(0, boundary);
+							buffer = buffer.slice(boundary + 2);
+							await handleEvent(controller, rawEvent);
+							_n++;
+						}
+						const _proc = performance.now() - _p0;
+						_lastRead = performance.now();
+						// desiredSize goes negative as we buffer ahead of the consumer; -desiredSize =
+						// how many events we've queued that the renderer hasn't drained yet. Large is
+						// FINE now (it means we're successfully decoupled and buffering ahead).
+						const _ahead = controller.desiredSize == null ? 0 : Math.max(0, -controller.desiredSize);
+						if (_ahead > _maxAhead) _maxAhead = _ahead;
+						if (_imgDiagOn() && (_gap > 150 || _proc > 16 || _n > 8)) {
+							_diag(`chunk#${_chunkNo}: ${_n} evt, ${_bytes}B | waitBeforeChunk=${Math.round(_gap)}ms | ourProcTime=${Math.round(_proc)}ms | queuedAhead=${_ahead}` +
+								(_gap > 150 && _proc < 8 ? ' | NETWORK GAP (should now be rare)' : '') +
+								(_proc > 16 ? ' | OUR processing (injection/measure)' : ''));
+						}
+					}
+				} catch (e) {
+					if (!_cancelled) { try { controller.error(e); } catch (_) {} }
+				}
+			})();
 		},
-		async flush(controller) {
-			buffer += decoder.decode();
-			if (buffer.trim()) await handleEvent(controller, buffer);
+		cancel(reason) {
+			_cancelled = true;
+			try { reader.cancel(reason); } catch (e) {}
 		}
 	});
-
-	return sourceBody.pipeThrough(transform);
 }
 
 // ==== FETCH INTERCEPTION — inject test markers into tool_use/thinking near image results ====
+
+// When we rebuild a Response around bytes the browser has ALREADY decoded, we must not copy
+// the transport/encoding headers of the original. The live completion SSE arrives with
+// content-encoding: br (Brotli, decompressed by the network stack before our reader sees it);
+// blindly copying that header labels our plain-text stream as Brotli. Same for content-length
+// (describes the compressed original) and transfer-encoding.
+function sanitizedHeaders(response) {
+	const h = new Headers(response.headers);
+	h.delete('content-encoding');
+	h.delete('content-length');
+	h.delete('transfer-encoding');
+	return h;
+}
+
 const _imageExtractorOriginalFetch = window.fetch;
 window.fetch = async (...args) => {
 	const [input, config] = args;
@@ -323,8 +452,27 @@ window.fetch = async (...args) => {
 		(url.includes('/completion') || url.includes('/retry_completion')) &&
 		config?.method === 'POST') {
 
+		// Only wrap conversations known to contain generated images (flagged by the
+		// load-time path). Everything else gets the native stream, untouched — JS
+		// re-piping janks streaming on some machines.
+		const convId = _convIdFromUrl(url);
+		if (!_conversationHasImages(convId)) {
+			_diag('wrapper skipped — conversation has no image history', convId);
+			return _imageExtractorOriginalFetch(...args);
+		}
+
 		const response = await _imageExtractorOriginalFetch(...args);
 		if (!response.body) return response;
+
+		// DIAGNOSTIC kill-switch: set localStorage['claude_qol_img_nowrap']='1' to bypass our
+		// stream wrapper entirely (pass the native response straight through). Lets us A/B test
+		// live whether the wrapper is the cause of the streaming jank — no rebuild needed.
+		try {
+			if (localStorage.getItem('claude_qol_img_nowrap') === '1') {
+				_diag('WRAPPER BYPASSED (claude_qol_img_nowrap=1) — native stream passed through');
+				return response;
+			}
+		} catch (e) { /* ignore */ }
 
 		let orgId = null;
 		try { orgId = getOrgId(); } catch (e) { /* no org id → cannot build preview URLs */ }
@@ -335,7 +483,7 @@ window.fetch = async (...args) => {
 			return new Response(transformed, {
 				status: response.status,
 				statusText: response.statusText,
-				headers: response.headers
+				headers: sanitizedHeaders(response)
 			});
 		} catch (e) {
 			console.error('[QOL-ImageExtractor] Failed to wrap completion stream, passing through:', e);
@@ -352,6 +500,7 @@ window.fetch = async (...args) => {
 		const data = await response.json();
 
 		if (data?.chat_messages) {
+			const convId = _convIdFromUrl(url);
 			// Org ID for building preview URLs when msg.files is empty (new API shape).
 			let orgId = null;
 			try { orgId = getOrgId(); } catch (e) { /* fail soft — fall back to file URLs */ }
@@ -374,6 +523,10 @@ window.fetch = async (...args) => {
 					const item = content[i];
 					if (item.type !== 'tool_result') continue;
 					if (!item.content?.some(c => c.type === 'image')) continue;
+
+					// Flag on detection (not on successful gallery build) so future completions
+					// in this conversation get the live wrapper even if this build fails.
+					_markConversationHasImages(convId);
 
 					// Collect all image items from this tool_result. Resolve URL from the
 					// file entry if present, otherwise build it ourselves, then measure
@@ -489,7 +642,7 @@ window.fetch = async (...args) => {
 		return new Response(JSON.stringify(data), {
 			status: response.status,
 			statusText: response.statusText,
-			headers: response.headers
+			headers: sanitizedHeaders(response)
 		});
 	}
 
