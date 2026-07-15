@@ -1,1 +1,2 @@
-Improved laggy responses caused by the image injection even when no images are present
+Fixed navigation arrows
+Fixed laggy responses caused by the image injection even when no images are present... again
