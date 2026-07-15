@@ -260,11 +260,13 @@
 	let _templateCache = null;
 
 	async function extractFontDataUris() {
+		// Family names are compared lowercased with whitespace stripped ("Anthropic Sans" -> anthropicsans)
 		const FONT_KEYS = {
 			'anthropicsans/normal': '{{FONT_SANS_NORMAL}}',
 			'anthropicsans/italic': '{{FONT_SANS_ITALIC}}',
 			'anthropicserif/normal': '{{FONT_SERIF_NORMAL}}',
 			'anthropicserif/italic': '{{FONT_SERIF_ITALIC}}',
+			'anthropicmono/normal': '{{FONT_MONO}}',
 			'jetbrains/normal': '{{FONT_MONO}}'
 		};
 
@@ -290,7 +292,7 @@
 					const urlMatch = block.match(urlRegex);
 					if (!familyMatch || !urlMatch) continue;
 
-					const family = familyMatch[1].trim().toLowerCase();
+					const family = familyMatch[1].trim().toLowerCase().replace(/\s+/g, '');
 					const style = (styleMatch && styleMatch[1]) || 'normal';
 					const key = family + '/' + style;
 					const placeholder = FONT_KEYS[key];
@@ -1603,13 +1605,14 @@
 				{ value: 'html_html', label: 'HTML (.html)', copyable: true },
 				{ value: 'zip_zip', label: 'Zip (.zip)', copyable: false },
 				{ value: 'md_md', label: 'Markdown (.md)', copyable: true },
+				{ value: 'txt_txt', label: 'Text (.txt)', copyable: true },
 				{ value: 'jsonl_jsonl', label: 'JSONL (.jsonl)', copyable: true },
 				{ value: 'librechat_json', label: 'Librechat (.json)', copyable: true },
 				{ value: 'raw_json', label: 'Raw JSON (.json)', copyable: true }
 			];
 			const isCopyable = (v) => EXPORT_FORMATS.find(f => f.value === v)?.copyable ?? false;
 
-			// Fall back if the saved format is no longer offered (e.g. the removed txt option)
+			// Fall back if the saved format is no longer offered
 			const selectedFormat = EXPORT_FORMATS.some(f => f.value === lastFormat) ? lastFormat : 'html_html';
 
 			// Format select
