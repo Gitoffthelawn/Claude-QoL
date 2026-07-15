@@ -378,7 +378,7 @@
 	// #endregion
 	// #region  USER NAVIGATION BUTTONS (MessageButtonBar)
 	function findMessageFromButton(button) {
-		const actionsGroup = button.closest('[role="group"][aria-label="Message actions"]');
+		const actionsGroup = button.closest('[role="toolbar"][aria-label="Message actions"], [role="group"][aria-label="Message actions"]');
 		if (!actionsGroup) return null;
 		const messageContainer = actionsGroup.closest('.group');
 		if (!messageContainer) return null;
