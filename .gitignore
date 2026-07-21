@@ -1,4 +1,5 @@
 manifest.json
+debug/
 userscripts/UNUSED-claude-tree.user.js
 web-ext-artifacts
 .vscode
