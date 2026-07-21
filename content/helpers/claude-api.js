@@ -1729,8 +1729,11 @@ class ClaudeProject {
 
 /**
  * Fetches account settings from the API.
- * WARNING: Only LIMITED settings are returned (artifacts, code execution).
- * To get complete settings, use conversation.getData().settings instead.
+ * Returns the full set of feature flags under `.settings` — this is the superset.
+ * conversation.getData().settings is only a ~10-key subset and is missing flags like
+ * enabled_melange entirely, so don't rely on it alone to detect enabled features.
+ * Note the conversation-level values still win where they exist: they're a snapshot of
+ * what the chat was created with, and a feature off at creation can't be enabled later.
  */
 async function getAccountSettings() {
 	const response = await fetch('/api/account');
@@ -1742,7 +1745,6 @@ async function getAccountSettings() {
 
 /**
  * Updates account settings via the API (PATCH).
- * Can modify ALL settings (not just the limited ones returned by getAccountSettings).
  * Changes are account-wide and affect all new conversations until changed again.
  * @param {Object} settings - Settings to update
  */
