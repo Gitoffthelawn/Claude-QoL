@@ -1,2 +1,2 @@
-Fixed navigation arrows
-Fixed laggy responses caused by the image injection even when no images are present... again
+Moved settings storage (minus API keys) to IndexedDB to persist across uninstalls to prevent loss of bookmarks/preferences.
+Image injection fixes
