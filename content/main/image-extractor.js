@@ -541,6 +541,13 @@ window.fetch = async (...args) => {
 						}
 						if (!imageUrl) return null; // no file entry and no orgId → cannot build
 
+						// The API serves preview_url root-relative ("/api/.../preview"). The gallery
+						// renderer treats images[].url as an external source and silently renders
+						// nothing for a relative path, so always hand it an absolute URL.
+						if (imageUrl.startsWith('/')) {
+							imageUrl = new URL(imageUrl, location.origin).href;
+						}
+
 						// Prefer dimensions from the file asset; otherwise measure the preview.
 						const asset = file?.preview_asset || file?.thumbnail_asset || {};
 						let realW = asset.image_width;
