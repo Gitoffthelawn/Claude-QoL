@@ -1964,6 +1964,7 @@ async function isLikelyTextFile(file) {
 }
 
 const CLAUDE_MODELS = [
+	{ value: 'claude-opus-5', label: 'Opus 5' },
 	{ value: 'claude-fable-5', label: 'Fable 5' },
 	{ value: 'claude-sonnet-5', label: 'Sonnet 5' },
 	{ value: 'claude-opus-4-8', label: 'Opus 4.8' },
@@ -1974,5 +1975,5 @@ const CLAUDE_MODELS = [
 	{ value: 'claude-3-opus-20240229', label: 'Opus 3' },
 ]
 
-const DEFAULT_CLAUDE_MODEL = 'claude-opus-4-8';
+const DEFAULT_CLAUDE_MODEL = 'claude-opus-5';
 const FAST_MODEL = 'claude-haiku-4-5-20251001';
