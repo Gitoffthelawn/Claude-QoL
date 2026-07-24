@@ -1,2 +1,2 @@
-Moved settings storage (minus API keys) to IndexedDB to persist across uninstalls to prevent loss of bookmarks/preferences.
-Image injection fixes
+Support Opus 5
+Added Opus 4.6 to extra models to pre-empt a possible removal
