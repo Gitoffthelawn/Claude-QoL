@@ -94,6 +94,40 @@ async function getPhantomMessages(conversationId) {
 	return result?.messages || null;
 }
 
+const ROOT_MESSAGE_UUID = "00000000-0000-4000-8000-000000000000";
+
+// Splice phantom (forked-in) messages onto the front of conversation data, the way the
+// page sees them. Rewiring the real root messages to hang off the last phantom is what
+// makes a parent-chain walk return the whole thing in order.
+//
+// `mutate: false` leaves the input untouched, which matters when the input is a cached
+// conversation payload — see ClaudeConversation.getRenderedMessages.
+function stitchPhantomMessages(data, phantomJson, { mutate = true } = {}) {
+	if (!phantomJson?.length) return data;
+
+	const lastPhantom = phantomJson[phantomJson.length - 1];
+	const isRoot = msg => msg.parent_message_uuid === ROOT_MESSAGE_UUID;
+
+	const realMessages = (data.chat_messages || []).map(msg => {
+		if (!isRoot(msg)) return msg;
+		const rewired = mutate ? msg : { ...msg };
+		rewired.parent_message_uuid = lastPhantom.uuid;
+		return rewired;
+	});
+
+	const chat_messages = [...phantomJson, ...realMessages];
+
+	if (!mutate) {
+		// Array order is all the copy's callers need. `index` is only meaningful for the
+		// page-facing payload, and rewriting it here would touch shared message objects.
+		return { ...data, chat_messages };
+	}
+
+	data.chat_messages = chat_messages;
+	data.chat_messages.forEach((msg, idx) => { msg.index = idx; });
+	return data;
+}
+
 async function clearPhantomMessages(conversationId) {
 	const clear = window.ClaudeSearchShared?.clearPhantomMessages;
 	if (clear) { await clear(conversationId); return; }
@@ -524,22 +558,14 @@ class ClaudeConversation {
 		return result.data;
 	}
 
-	// Get messages - when tree=false, reconstructs the current trunk from full tree data
-	async getMessages(tree = false, forceRefresh = false) {
-		const data = await this.getData(forceRefresh);
+	// Reconstruct the current trunk from full tree data: walk from current leaf to root
+	_trunkFrom(data) {
 		const allMessages = data.chat_messages || [];
-
-		if (tree) {
-			return allMessages.map(msg => ClaudeMessage.fromHistoryJSON(this, msg));
-		}
-
-		// Reconstruct trunk: walk from current leaf to root
 		const messageMap = new Map(allMessages.map(msg => [msg.uuid, msg]));
-		const rootId = "00000000-0000-4000-8000-000000000000";
 		const trunk = [];
 		let currentId = data.current_leaf_message_uuid;
 
-		while (currentId && currentId !== rootId) {
+		while (currentId && currentId !== ROOT_MESSAGE_UUID) {
 			const msg = messageMap.get(currentId);
 			if (!msg) break;
 			trunk.push(msg);
@@ -548,6 +574,42 @@ class ClaudeConversation {
 
 		trunk.reverse();
 		return trunk.map(msg => ClaudeMessage.fromHistoryJSON(this, msg));
+	}
+
+	// Get messages - when tree=false, reconstructs the current trunk from full tree data.
+	// Never includes phantom messages: getData passes skip_uuid_injection=true, so the
+	// phantom interceptor leaves our own requests alone. Use getRenderedMessages() when you
+	// need the list the UI is actually showing.
+	async getMessages(tree = false, forceRefresh = false) {
+		const data = await this.getData(forceRefresh);
+
+		if (tree) {
+			return (data.chat_messages || []).map(msg => ClaudeMessage.fromHistoryJSON(this, msg));
+		}
+
+		return this._trunkFrom(data);
+	}
+
+	// The current branch as the UI renders it: phantom (forked-in) history first, then the
+	// real messages. Anything that has to line up with what's on screen — locating a row,
+	// counting positions — needs this rather than getMessages().
+	async getRenderedMessages(forceRefresh = false) {
+		const data = await this.getData(forceRefresh);
+
+		let phantoms = null;
+		try {
+			phantoms = await getPhantomMessages(this.conversationId);
+		} catch (error) {
+			console.error('[QOL-API] Failed to load phantom messages:', error);
+		}
+		if (!phantoms?.length) return this._trunkFrom(data);
+
+		// MAIN world hands back hydrated ClaudeMessages, ISOLATED raw history JSON.
+		const phantomJson = phantoms.map(msg => msg.toHistoryJSON ? msg.toHistoryJSON() : msg);
+
+		// Non-mutating: `data` is cached on this instance and in IndexedDB, and must stay
+		// phantom-free so getMessages() keeps returning the real branch.
+		return this._trunkFrom(stitchPhantomMessages(data, phantomJson, { mutate: false }));
 	}
 
 	// Find longest leaf from a message ID
