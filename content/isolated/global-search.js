@@ -575,8 +575,7 @@
 		const matches = [];
 
 		for (const entry of allMessages) {
-			const lowerText = entry.searchableText.toLowerCase();
-			const matchCount = (lowerText.match(new RegExp(lowerQuery, 'gi')) || []).length;
+			const matchCount = findMatches(entry.searchableText, lowerQuery).length;
 
 			if (matchCount > 0) {
 				matches.push({ uuid: entry.uuid, matchCount });
