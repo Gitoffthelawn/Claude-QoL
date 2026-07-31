@@ -405,12 +405,21 @@
 			throw new Error(`Manifest fetch failed: ${manifestResult ? manifestResult.error : 'no response'}`);
 		}
 
-		const dataFiles = (manifestResult.manifest.data_files || [])
+		// The signed URL either points at a manifest listing per-batch nonces, or straight at the
+		// archive. In the latter case there is nothing to resolve — the URL we hold is the only batch.
+		const zipUrls = [];
+		if (manifestResult.isZip) {
+			console.log('[QOL-GDPRExport] Export is a single archive, no manifest indirection');
+			zipUrls.push(manifestSignedUrl);
+		}
+
+		const dataFiles = manifestResult.isZip ? [] : (manifestResult.manifest.data_files || [])
 			.slice()
 			.sort((a, b) => a.batch_index - b.batch_index);
-		console.log('[QOL-GDPRExport] Manifest lists', dataFiles.length, 'batch file(s)');
+		if (!manifestResult.isZip) {
+			console.log('[QOL-GDPRExport] Manifest lists', dataFiles.length, 'batch file(s)');
+		}
 
-		const zipUrls = [];
 		for (const file of dataFiles) {
 			const batchNonce = file.export_url.split('/').pop();
 			let resolved = await resolveExportSignedUrl(orgId, batchNonce);
@@ -425,6 +434,10 @@
 				throw new Error(`Batch ${file.batch_index} unavailable: ${resolved.message || resolved.status}`);
 			}
 			zipUrls.push(resolved.signedUrl);
+		}
+
+		if (zipUrls.length === 0) {
+			throw new Error('The export contained no data files');
 		}
 
 		// Phase 4: Hand the ZIP URLs to the background to download, unzip and stream back.
