@@ -12,3 +12,5 @@ icon_svgs/*
 promo_*
 screenshot_*
 nul
+*.swp
+*.swo
