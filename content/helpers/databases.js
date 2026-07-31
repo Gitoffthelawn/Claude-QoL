@@ -359,8 +359,10 @@
 			}
 		}
 
-		// Existence check only, so it reads keys instead of decrypting every conversation.
-		async getAllMessageIds() {
+		// Which conversations have message text stored. The keys of `messages` are conversation
+		// uuids, one row per conversation, so this answers the existence question without reading
+		// (and decrypting) a single value.
+		async getAllConversationIdsWithMessages() {
 			return await db.messages.toCollection().primaryKeys();
 		}
 

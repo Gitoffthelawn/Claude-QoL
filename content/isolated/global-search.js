@@ -29,7 +29,7 @@
 
 		const storedMetadata = await searchDB.getAllMetadata();
 		const storedMap = new Map(storedMetadata.map(m => [m.uuid, m]));
-		const storedMessageIds = new Set(await searchDB.getAllMessageIds());
+		const convIdsWithMessages = new Set(await searchDB.getAllConversationIdsWithMessages());
 
 		const toUpdate = [];
 		for (const conv of allConversations) {
@@ -37,7 +37,7 @@
 
 			if (!stored) {
 				toUpdate.push(conv);
-			} else if (!storedMessageIds.has(conv.uuid)) {
+			} else if (!convIdsWithMessages.has(conv.uuid)) {
 				// Metadata exists but no messages - needs update
 				toUpdate.push(conv);
 			} else if (new Date(conv.updated_at) > new Date(stored.updated_at)) {
