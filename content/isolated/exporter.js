@@ -11,13 +11,13 @@
 			apiName: "human",
 			exportDelimiter: "User",
 			librechatName: "User",
-			jsonlName: "user"
+			tavernName: "User"
 		},
 		ASSISTANT: {
 			apiName: "assistant",
 			exportDelimiter: "Assistant",
 			librechatName: "Claude",
-			jsonlName: "assistant"
+			tavernName: "Claude"
 		}
 	};
 	const EXPORT_TAG_PREFIX = 'CLEXP:';
@@ -30,6 +30,15 @@
 		const lastDot = filename.lastIndexOf('.');
 		if (lastDot === -1) return `${filename}-${uuid}`;
 		return `${filename.substring(0, lastDot)}-${uuid}${filename.substring(lastDot)}`;
+	}
+
+	// Replicates SillyTavern's own humanizedDateTime(): YYYY-MM-DD@HHhMMmSSsMSms, local time.
+	function humanizedDateTime(timestamp) {
+		const parsed = timestamp ? new Date(timestamp) : new Date();
+		const date = isNaN(parsed.getTime()) ? new Date() : parsed;
+		const pad = (value, length = 2) => String(value).padStart(length, '0');
+		return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+			`@${pad(date.getHours())}h${pad(date.getMinutes())}m${pad(date.getSeconds())}s${pad(date.getMilliseconds(), 3)}ms`;
 	}
 
 	//#region Export format handlers
@@ -125,14 +134,55 @@
 		return output;
 	}
 
+	// SillyTavern chat file: JSONL, first line a header, one message per line after it.
+	// Field names follow SillyTavern's own writer. Its importer copies the file verbatim into the
+	// character's chat folder, so the shape has to be right on the way out - it only checks that the
+	// header carries user_name, name or chat_metadata, and rejects the file outright otherwise.
+	// No BOM either: it runs JSON.parse on the first line, which throws on a leading U+FEFF.
 	function formatJsonlExport(conversationData, messages, conversationId) {
-		// Simple JSONL - just role and text
-		return messages.map(msg => {
-			return JSON.stringify({
-				role: msg.sender === ROLES.USER.apiName ? ROLES.USER.jsonlName : ROLES.ASSISTANT.jsonlName,
-				content: ClaudeConversation.extractMessageText(msg)
-			});
-		}).join('\n');
+		const header = {
+			user_name: ROLES.USER.tavernName,
+			character_name: ROLES.ASSISTANT.tavernName,
+			create_date: humanizedDateTime(conversationData.created_at),
+			chat_metadata: {}
+		};
+
+		const lines = messages.map(msg => {
+			const isUser = msg.sender === ROLES.USER.apiName;
+			const text = ClaudeConversation.extractMessageText(msg);
+
+			// Always carried: SillyTavern renders extra.reasoning as a collapsed block separate from
+			// the message body, so it costs nothing the way inlined thinking does in markdown.
+			const extra = {};
+			const reasoning = msg.content
+				.filter(c => c.type === 'thinking')
+				.map(c => c.thinking || '')
+				.filter(Boolean)
+				.join('\n');
+			if (reasoning) {
+				extra.reasoning = reasoning;
+				extra.reasoning_type = 'model';
+			}
+
+			const isoTimestamp = msg.created_at || msg.updated_at;
+			const sendDate = isoTimestamp ? new Date(isoTimestamp) : new Date();
+
+			return {
+				name: isUser ? ROLES.USER.tavernName : ROLES.ASSISTANT.tavernName,
+				is_user: isUser,
+				is_system: false,
+				send_date: (isNaN(sendDate.getTime()) ? new Date() : sendDate).toISOString(),
+				mes: text,
+				// A SillyTavern swipe is alternate text for one message, not a branch: the messages
+				// after it stay put. Our regenerations are real subtrees, so they cannot round-trip
+				// as swipes; we export the same single path the other formats do.
+				swipe_id: 0,
+				swipes: [text],
+				extra
+			};
+		});
+
+		return [header, ...lines].map(entry => JSON.stringify(entry)).join('\n') + '\n';
 	}
 
 	function formatLibrechatExport(conversationData, messages, conversationId) {
@@ -1606,9 +1656,9 @@
 				{ value: 'zip_zip', label: 'Zip (.zip)', copyable: false },
 				{ value: 'md_md', label: 'Markdown (.md)', copyable: true },
 				{ value: 'txt_txt', label: 'Text (.txt)', copyable: true },
-				{ value: 'jsonl_jsonl', label: 'JSONL (.jsonl)', copyable: true },
+				{ value: 'jsonl_jsonl', label: 'SillyTavern (.jsonl)', copyable: true },
 				{ value: 'librechat_json', label: 'Librechat (.json)', copyable: true },
-				{ value: 'raw_json', label: 'Raw JSON (.json)', copyable: true }
+				{ value: 'raw_json', label: 'Anthropic JSON (.json)', copyable: true }
 			];
 			const isCopyable = (v) => EXPORT_FORMATS.find(f => f.value === v)?.copyable ?? false;
 
