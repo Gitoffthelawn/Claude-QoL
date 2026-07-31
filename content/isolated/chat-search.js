@@ -2,7 +2,24 @@
 (function () {
 	'use strict';
 
-	const { getRelativeTime, simplifyText, fuzzyMatch } = window.ClaudeSearchShared;
+	const { getRelativeTime, simplifyText, fuzzyMatch, compileQuery, findMatches } = window.ClaudeSearchShared;
+
+	// Fill `el` with `text`, wrapping every match in a highlight. Builds nodes rather than assigning
+	// innerHTML - message text is arbitrary and would otherwise be parsed as markup.
+	function highlightInto(el, text, matcher) {
+		el.textContent = '';
+		const matches = findMatches(text, matcher);
+		let at = 0;
+		for (const m of matches) {
+			if (m.start > at) el.appendChild(document.createTextNode(text.slice(at, m.start)));
+			const mark = document.createElement('strong');
+			mark.className = 'bg-yellow-200 dark:bg-yellow-800';
+			mark.textContent = text.slice(m.start, m.end);
+			el.appendChild(mark);
+			at = m.end;
+		}
+		if (at < text.length) el.appendChild(document.createTextNode(text.slice(at)));
+	}
 
 	// ======== SEARCH FUNCTION ========
 	async function searchMessages(query, conversation) {
@@ -10,7 +27,7 @@
 			return [];
 		}
 
-		const lowerQuery = query.toLowerCase();
+		const matcher = compileQuery(query);
 		const results = [];
 		const messages = await conversation.getMessages(true);
 
@@ -36,14 +53,13 @@
 		for (let index = 0; index < messages.length; index++) {
 			const message = messages[index];
 			const text = ClaudeConversation.extractMessageText(message);
-			const lowerText = text.toLowerCase();
-			const matchIndex = lowerText.indexOf(lowerQuery);
+			const firstMatch = findMatches(text, matcher)[0];
 
-			if (matchIndex !== -1) {
+			if (firstMatch) {
 				// Extract ~100 chars centered on match
 				const contextChars = 50;
-				const startIndex = Math.max(0, matchIndex - contextChars);
-				const endIndex = Math.min(text.length, matchIndex + query.length + contextChars);
+				const startIndex = Math.max(0, firstMatch.start - contextChars);
+				const endIndex = Math.min(text.length, firstMatch.end + contextChars);
 
 				let matchedText = text.substring(startIndex, endIndex);
 				if (startIndex > 0) matchedText = '...' + matchedText;
@@ -122,20 +138,7 @@
 			textBox.className = 'p-3 rounded bg-bg-200 border border-border-300';
 
 			if (isMatched && query) {
-				// Highlight the match
-				const lowerText = text.toLowerCase();
-				const lowerQuery = query.toLowerCase();
-				const matchIndex = lowerText.indexOf(lowerQuery);
-
-				if (matchIndex !== -1) {
-					const before = text.substring(0, matchIndex);
-					const match = text.substring(matchIndex, matchIndex + query.length);
-					const after = text.substring(matchIndex + query.length);
-
-					textBox.innerHTML = `${before}<strong class="bg-yellow-200 dark:bg-yellow-800">${match}</strong>${after}`;
-				} else {
-					textBox.textContent = text;
-				}
+				highlightInto(textBox, text, compileQuery(query));
 			} else {
 				textBox.textContent = text;
 			}
@@ -351,7 +354,7 @@
 
 		const searchInput = createClaudeInput({
 			type: 'text',
-			placeholder: 'Search messages...',
+			placeholder: 'Search messages... (/regex/)',
 		});
 		searchInput.className += ' flex-1';
 
@@ -410,19 +413,7 @@
 				matchText.className = 'text-text-100';
 
 				// Highlight the match in the preview
-				const lowerMatched = result.matched_text.toLowerCase();
-				const lowerQuery = query.toLowerCase();
-				const matchIndex = lowerMatched.indexOf(lowerQuery);
-
-				if (matchIndex !== -1) {
-					const before = result.matched_text.substring(0, matchIndex);
-					const match = result.matched_text.substring(matchIndex, matchIndex + query.length);
-					const after = result.matched_text.substring(matchIndex + query.length);
-
-					matchText.innerHTML = `${before}<strong class="bg-yellow-200 dark:bg-yellow-800">${match}</strong>${after}`;
-				} else {
-					matchText.textContent = result.matched_text;
-				}
+				highlightInto(matchText, result.matched_text, compileQuery(query));
 
 				resultItem.appendChild(header);
 				resultItem.appendChild(matchText);
