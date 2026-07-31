@@ -359,6 +359,11 @@
 			}
 		}
 
+		// Existence check only, so it reads keys instead of decrypting every conversation.
+		async getAllMessageIds() {
+			return await db.messages.toCollection().primaryKeys();
+		}
+
 		async getAllMessages() {
 			const all = await db.messages.toArray();
 			const results = [];
