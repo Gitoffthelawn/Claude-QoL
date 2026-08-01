@@ -1,2 +1,4 @@
-Support Opus 5
-Added Opus 4.6 to extra models to pre-empt a possible removal
+Fix navigation/search for new virtualized message list
+Add regex support to chat/global search
+Fix JSONL exports
+Performance improvements/bugfixes (@przemub)
