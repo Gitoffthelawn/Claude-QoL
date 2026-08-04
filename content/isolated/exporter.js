@@ -1436,9 +1436,14 @@
 	}
 	//#endregion
 
-	async function exportSingleConversation(orgId, conversationId, format, extension, exportTree, exportOptions, loadingModal) {
+	async function exportSingleConversation(orgId, conversationId, format, extension, exportTree, exportOptions, loadingModal, freshnessHint = null) {
 		const conversation = new ClaudeConversation(orgId, conversationId);
-		const conversationData = await conversation.getData();
+		// Bulk export passes the freshness it already learned from the conversation list. Without
+		// one there is nothing cheaper than a full fetch — a freshness check costs the same TTFB
+		// as the data itself — so skip the cache rather than pay for it twice.
+		const conversationData = freshnessHint
+			? await conversation.getData(false, freshnessHint)
+			: await conversation.getData(true);
 		const wasCached = conversation.lastGetDataFromCache;
 		const messages = await conversation.getMessages(exportTree);
 		const safeName = (conversationData.name || 'untitled').replace(/[<>:"/\\|?*]/g, '_');
@@ -1493,6 +1498,14 @@
 				return;
 			}
 
+			// The list already tells us, per conversation, everything the cache needs to be
+			// judged against — so cached conversations cost an IndexedDB read instead of a
+			// full API round trip each.
+			const freshness = new Map(conversations.map(c => [c.uuid, {
+				updated_at: c.updated_at,
+				current_leaf_message_uuid: c.current_leaf_message_uuid
+			}]));
+
 			const masterZip = new JSZip();
 			let completed = 0;
 			const total = conversations.length;
@@ -1510,7 +1523,8 @@
 					const conv = chunk[i];
 					try {
 						const { filename, blob, wasCached } = await exportSingleConversation(
-							orgId, conv.uuid, format, extension, exportTree, exportOptions, loadingModal
+							orgId, conv.uuid, format, extension, exportTree, exportOptions, loadingModal,
+							freshness.get(conv.uuid)
 						);
 						results.push({ filename, blob });
 

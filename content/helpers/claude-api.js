@@ -157,7 +157,8 @@ async function bustReactQueryCache() {
 bustReactQueryCache();
 
 // Shared streaming freshness check.
-// Fetches apiUrl, reads first ~8KB to find updated_at, compares with cachedEntry.
+// Fetches apiUrl, reads the conversation header (everything before "chat_messages") and
+// compares updated_at *and* current_leaf_message_uuid with cachedEntry.
 // Returns { data, fromCache } on success, null on failure.
 // fetchFn allows callers to pass in the real (unpatched) fetch.
 async function streamingFreshnessCheck(apiUrl, cachedEntry, fetchFn = fetch) {
@@ -167,28 +168,38 @@ async function streamingFreshnessCheck(apiUrl, cachedEntry, fetchFn = fetch) {
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
 	let accumulated = '';
-	const MAX_BYTES = 8192;
+	// The header is normally ~1KB, but the settings blob (enabled_mcp_tools) can push it past
+	// 12KB. This cap is only a safety valve: overshoot it and we fall through to the full read.
+	const MAX_HEADER_BYTES = 131072;
 
 	try {
-		while (accumulated.length < MAX_BYTES) {
+		let chatMsgIdx = -1;
+		while (accumulated.length < MAX_HEADER_BYTES) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			accumulated += decoder.decode(value, { stream: true });
 
-			const chatMsgIdx = accumulated.indexOf('"chat_messages"');
-			const searchRegion = chatMsgIdx !== -1 ? accumulated.substring(0, chatMsgIdx) : accumulated;
-			const match = searchRegion.match(/"updated_at"\s*:\s*"([^"]+)"/);
-			if (match) {
-				if (cachedEntry.updated_at >= match[1]) {
-					reader.cancel();
-					return { data: cachedEntry.data, fromCache: true };
-				}
-				break;
-			}
+			chatMsgIdx = accumulated.indexOf('"chat_messages"');
 			if (chatMsgIdx !== -1) break;
 		}
 
-		// Cache stale or updated_at not found — read remaining stream
+		if (chatMsgIdx !== -1) {
+			const header = accumulated.substring(0, chatMsgIdx);
+			const updatedAt = header.match(/"updated_at"\s*:\s*"([^"]+)"/)?.[1];
+			const leaf = header.match(/"current_leaf_message_uuid"\s*:\s*"([^"]+)"/)?.[1];
+
+			// The leaf has to match too. Switching branches does not bump updated_at, so a
+			// timestamp check on its own keeps serving whichever branch was selected when the
+			// entry was cached — which is the branch a linear export then walks.
+			if (updatedAt && leaf &&
+				cachedEntry.updated_at >= updatedAt &&
+				cachedEntry.data?.current_leaf_message_uuid === leaf) {
+				reader.cancel();
+				return { data: cachedEntry.data, fromCache: true };
+			}
+		}
+
+		// Cache stale, or the header didn't yield both fields — read remaining stream
 		const chunks = [accumulated];
 		while (true) {
 			const { done, value } = await reader.read();
@@ -500,8 +511,13 @@ class ClaudeConversation {
 	}
 
 	// Lazy load conversation data (always fetches full tree)
-	// Uses IndexedDB cache with streaming freshness check to avoid downloading large payloads
-	async getData(forceRefresh = false) {
+	// Uses IndexedDB cache with streaming freshness check to avoid downloading large payloads.
+	//
+	// freshnessHint is { updated_at, current_leaf_message_uuid } for this conversation as the
+	// server currently has it. chat_conversations_v2 carries both fields for every conversation
+	// in one response, so a caller working through a list already knows them and we can settle
+	// freshness locally instead of spending a request per conversation.
+	async getData(forceRefresh = false, freshnessHint = null) {
 		if (!this.created) {
 			return this.conversationData;
 		}
@@ -516,13 +532,23 @@ class ClaudeConversation {
 		if (!forceRefresh) {
 			try {
 				const cachedEntry = await _convCacheGet(this.conversationId);
-				console.log('Cache entry:', cachedEntry);
 				if (cachedEntry) {
-					const freshData = await this._streamingFreshnessCheck(apiUrl, cachedEntry);
-					if (freshData) {
-						this.conversationData = freshData;
-						this._syncAccountFeatureSettings();
-						return this.conversationData;
+					if (freshnessHint) {
+						if (cachedEntry.updated_at >= freshnessHint.updated_at &&
+							cachedEntry.data?.current_leaf_message_uuid === freshnessHint.current_leaf_message_uuid) {
+							this.lastGetDataFromCache = true;
+							this.conversationData = cachedEntry.data;
+							this._syncAccountFeatureSettings();
+							return this.conversationData;
+						}
+						// Hint says stale — no point checking again over the wire.
+					} else {
+						const freshData = await this._streamingFreshnessCheck(apiUrl, cachedEntry);
+						if (freshData) {
+							this.conversationData = freshData;
+							this._syncAccountFeatureSettings();
+							return this.conversationData;
+						}
 					}
 				}
 			} catch (e) {
