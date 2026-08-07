@@ -185,33 +185,18 @@
 		return [header, ...lines].map(entry => JSON.stringify(entry)).join('\n') + '\n';
 	}
 
-	//#region LibreChat tool calls
+	//#region Tool call helpers (shared by the LibreChat and HTML exports)
 
-	// LibreChat hard-codes these tool names to purpose-built renderers that read from their own
-	// context/schema instead of the tool call's `output` string (see Part.tsx). A Claude tool that
-	// happens to share a name would render as an empty card, so it gets suffixed instead.
-	const LIBRECHAT_RESERVED_TOOL_NAMES = new Set([
-		'web_search', 'bash_tool', 'read_file', 'create_file', 'edit_file',
-		'file_search', 'retrieval', 'skill', 'subagent', 'execute_code'
-	]);
-
-	// LibreChat names MCP tools `${tool}_mcp_${server}` (its mcp_delimiter is '_mcp_'); Claude names
-	// them `Server:tool`. Translating gets us LibreChat's MCP chip and server icon, and the result
-	// can never collide with the reserved names above.
-	function toLibrechatToolName(name) {
-		const sep = name.indexOf(':');
-		if (sep > 0 && sep < name.length - 1) {
-			return `${name.slice(sep + 1)}_mcp_${name.slice(0, sep)}`;
+	// Claude emits a tool_use and its tool_result as sibling blocks in the same message, so results
+	// pair up by id without having to look at neighbouring messages.
+	function mapToolResultsById(content) {
+		const byId = new Map();
+		for (const item of content || []) {
+			if (item.type === 'tool_result' && item.tool_use_id) {
+				byId.set(item.tool_use_id, item);
+			}
 		}
-		return LIBRECHAT_RESERVED_TOOL_NAMES.has(name) ? `${name}_claude` : name;
-	}
-
-	// Claude stores web_search/web_fetch results as `knowledge` stubs — title, url and favicon
-	// metadata, but never the retrieved page text — so there is nothing faithful to export for them.
-	// Gating on the content types we can actually represent (rather than a tool-name blocklist)
-	// drops those automatically and degrades correctly for tools we haven't seen yet.
-	function isExportableToolResult(result) {
-		return (result?.content || []).some(item => item.type === 'text' || item.type === 'image');
+		return byId;
 	}
 
 	function blobToDataUri(blob) {
@@ -223,8 +208,8 @@
 		});
 	}
 
-	// Resolves to null rather than throwing — a missing size just means we skip the attachment,
-	// since LibreChat needs real dimensions to render one inline.
+	// Resolves to null rather than throwing — callers treat unknown dimensions as "not renderable"
+	// instead of failing the whole export.
 	function getImageSize(blob) {
 		return new Promise((resolve) => {
 			const url = URL.createObjectURL(blob);
@@ -242,6 +227,70 @@
 		});
 	}
 
+	// Tool-generated images never appear in msg.files (that only carries user uploads), so the
+	// file_uuid on the tool_result is the only handle we get. /preview is the sole endpoint that
+	// serves them — the bare file URL and the usual /document, /content and /download variants all
+	// 404 — and it re-encodes to webp regardless of what the tool originally produced, so callers
+	// should trust the returned mimeType over any filename the tool declared.
+	async function downloadGeneratedImage(orgId, fileUuid) {
+		const file = new ClaudeFile({
+			file_uuid: fileUuid,
+			file_name: fileUuid,
+			file_kind: 'image',
+			preview_url: `https://claude.ai/api/${orgId}/files/${fileUuid}/preview`
+		});
+
+		const blob = await file.download();
+		if (!blob) return null;
+
+		return {
+			blob,
+			mimeType: (blob.type || '').split(';')[0].trim(),
+			dataUri: await blobToDataUri(blob),
+			size: await getImageSize(blob)
+		};
+	}
+	//#endregion
+
+	//#region LibreChat tool calls
+
+	// LibreChat hard-codes these tool names to purpose-built renderers that read from their own
+	// context/schema instead of the tool call's `output` string (see Part.tsx). A Claude tool that
+	// happens to share a name would render as an empty card, so it gets suffixed instead.
+	const LIBRECHAT_RESERVED_TOOL_NAMES = new Set([
+		'web_search', 'bash_tool', 'read_file', 'create_file', 'edit_file',
+		'file_search', 'retrieval', 'skill', 'subagent', 'execute_code'
+	]);
+
+	// Model providers conventionally constrain tool names to [A-Za-z0-9_-], and Claude's MCP server
+	// names can carry spaces and parens ("ComfyUI (Remote)"). Collapse each RUN of anything else to
+	// a single '-'; collapsing rather than substituting per character matters because LibreChat
+	// rewrites '---' to '.' when it renders the server name, and a per-character swap would emit
+	// that run for a name like "ComfyUI (Remote)".
+	function normalizeToolNamePart(part) {
+		return part.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+	}
+
+	// LibreChat names MCP tools `${tool}_mcp_${server}` (its mcp_delimiter is '_mcp_'); Claude names
+	// them `Server:tool`. Translating gets us LibreChat's MCP chip and server icon, and the result
+	// can never collide with the reserved names above.
+	function toLibrechatToolName(name) {
+		const sep = name.indexOf(':');
+		if (sep > 0 && sep < name.length - 1) {
+			return `${normalizeToolNamePart(name.slice(sep + 1))}_mcp_${normalizeToolNamePart(name.slice(0, sep))}`;
+		}
+		const normalized = normalizeToolNamePart(name);
+		return LIBRECHAT_RESERVED_TOOL_NAMES.has(normalized) ? `${normalized}_claude` : normalized;
+	}
+
+	// Claude stores web_search/web_fetch results as `knowledge` stubs — title, url and favicon
+	// metadata, but never the retrieved page text — so there is nothing faithful to export for them.
+	// Gating on the content types we can actually represent (rather than a tool-name blocklist)
+	// drops those automatically and degrades correctly for tools we haven't seen yet.
+	function isExportableToolResult(result) {
+		return (result?.content || []).some(item => item.type === 'text' || item.type === 'image');
+	}
+
 	// LibreChat only renders an image inline when its filename carries one of these extensions
 	// (its imageExtRegex). Anything outside the set degrades to a download chip no matter what we
 	// do, so an unexpected format is better skipped than mislabelled.
@@ -254,40 +303,26 @@
 		'image/heif': 'heif'
 	};
 
-	// Tool-generated images never appear in msg.files (that only carries user uploads), so the
-	// file_uuid on the tool_result is the only handle we get. /preview is the sole endpoint that
-	// serves them — the bare file URL and the usual /document, /content and /download variants all
-	// 404 — and it re-encodes to webp regardless of what the tool originally produced, so the
-	// filename is derived from the bytes we actually receive rather than from any declared name.
+	// The filename is derived from the bytes we actually received rather than any name the tool
+	// declared, since /preview re-encodes (see downloadGeneratedImage).
 	async function buildGeneratedImageAttachment(orgId, fileUuid, toolCallId, messageId, conversationId) {
-		const file = new ClaudeFile({
-			file_uuid: fileUuid,
-			file_name: fileUuid,
-			file_kind: 'image',
-			preview_url: `https://claude.ai/api/${orgId}/files/${fileUuid}/preview`
-		});
-
-		const blob = await file.download();
-		if (!blob) return null;
-
-		const mimeType = (blob.type || '').split(';')[0].trim();
-		const extension = LIBRECHAT_IMAGE_EXTENSIONS[mimeType];
-		if (!extension) return null;
+		const image = await downloadGeneratedImage(orgId, fileUuid);
+		if (!image) return null;
 
 		// LibreChat needs the filename extension, width, height and filepath ALL present to render
 		// an attachment inline (isImageAttachment); missing any one silently degrades it to a
 		// download chip, so bail out rather than emit a half-populated attachment.
-		const size = await getImageSize(blob);
-		if (!size) return null;
+		const extension = LIBRECHAT_IMAGE_EXTENSIONS[image.mimeType];
+		if (!extension || !image.size) return null;
 
 		return {
 			file_id: fileUuid,
 			filename: `${fileUuid}.${extension}`,
-			filepath: await blobToDataUri(blob),
-			type: mimeType,
-			width: size.width,
-			height: size.height,
-			bytes: blob.size,
+			filepath: image.dataUri,
+			type: image.mimeType,
+			width: image.size.width,
+			height: image.size.height,
+			bytes: image.blob.size,
 			source: 'local',
 			object: 'file',
 			context: 'image_generation',
@@ -335,14 +370,7 @@
 				}
 			}
 
-			// Claude emits a tool_use and its tool_result as sibling blocks in the same message,
-			// so results can be paired up by id without looking at neighbouring messages.
-			const toolResultsById = new Map();
-			for (const item of msg.content) {
-				if (item.type === 'tool_result' && item.tool_use_id) {
-					toolResultsById.set(item.tool_use_id, item);
-				}
-			}
+			const toolResultsById = mapToolResultsById(msg.content);
 
 			// Build content array: think, text, and exportable tool calls
 			const content = [];
@@ -571,6 +599,57 @@
 		return str.replace(/<\//g, '<\\/');
 	}
 
+	// Renders one tool call as a collapsible block, mirroring the thinking-block idiom. Images are
+	// deliberately excluded — the caller emits those as always-visible siblings, since a generated
+	// image is primary content rather than a detail worth hiding behind a toggle.
+	function renderToolBlockHtml(toolUse, result) {
+		const name = toolUse.name || 'tool';
+		// `message` is Claude's own human-readable label ("Generate illustrated image"); it is not
+		// always present, and when it is it can repeat the name, so only show both when they differ.
+		const label = toolUse.message || name;
+		const body = [];
+
+		if (toolUse.input && Object.keys(toolUse.input).length > 0) {
+			body.push(`<pre class="tool-args">${esc(JSON.stringify(toolUse.input, null, 2))}</pre>`);
+		}
+
+		if (!result) {
+			// A tool_use with no tool_result means the generation was interrupted. Worth recording
+			// in an archive: it says the call was attempted.
+			body.push(`<div class="tool-empty">No result recorded.</div>`);
+		} else {
+			const texts = (result.content || [])
+				.filter(item => item.type === 'text')
+				.map(item => item.text || '')
+				.filter(Boolean);
+			if (texts.length > 0) {
+				body.push(`<pre class="tool-output">${esc(texts.join('\n'))}</pre>`);
+			}
+
+			// web_search / web_fetch return `knowledge` stubs: title, url and site metadata, never
+			// the retrieved page text. A source list is all that can be shown, but in an archive
+			// that is still real content. Favicon URLs in the metadata are deliberately ignored —
+			// they point at a remote service, and this export must open offline.
+			const sources = (result.content || []).filter(item => item.type === 'knowledge');
+			if (sources.length > 0) {
+				const items = sources.map(source => {
+					const site = source.metadata?.site_name || source.metadata?.site_domain || '';
+					const title = esc(source.title || source.url || 'Untitled');
+					const link = source.url
+						? `<a href="${esc(source.url)}" target="_blank" rel="noopener noreferrer">${title}</a>`
+						: title;
+					return `<li>${link}${site ? `<span class="tool-source-site">${esc(site)}</span>` : ''}</li>`;
+				}).join('');
+				body.push(`<ul class="tool-sources">${items}</ul>`);
+			}
+		}
+
+		const nameTag = label === name ? '' : `<span class="tool-name">${esc(name)}</span>`;
+		const failedTag = result?.is_error ? `<span class="tool-failed">failed</span>` : '';
+		const errorClass = result?.is_error ? ' tool-error' : '';
+		return `<details class="tool-block${errorClass}"><summary>${esc(label)}${nameTag}${failedTag}</summary>${body.join('')}</details>`;
+	}
+
 	async function formatHtmlExport(conversationData, messages, conversationId) {
 		// Configure marked to use highlight.js for code blocks
 		marked.use({
@@ -611,6 +690,20 @@
 			sender: m.sender
 		}));
 
+		// Needed to build preview URLs for tool-generated images; fail soft so a missing org id
+		// costs us the images rather than the whole export.
+		let orgId = null;
+		try { orgId = getOrgId(); } catch (e) { console.warn('[Exporter] No org id; skipping generated images'); }
+
+		// One pacer shared by generated-image and attachment downloads. Both run per message, so
+		// per-loop delays would let a message carrying an image AND files fire two bursts back to
+		// back — the delay exists to stay under rate limiting, so it has to span every download.
+		let downloadCount = 0;
+		const paceDownload = async () => {
+			if (downloadCount > 0) await new Promise(r => setTimeout(r, 200));
+			downloadCount++;
+		};
+
 		// Render ALL messages as hidden divs
 		let messagesHtml = `<div class="export-meta"><h1>${esc(title)}</h1>`;
 		if (conversationData.model) {
@@ -622,6 +715,14 @@
 			const role = isUser ? 'User' : 'Assistant';
 			const roleClass = isUser ? 'msg-user' : 'msg-assistant';
 
+			const toolResultsById = mapToolResultsById(message.content);
+			// Older conversations list a generated image BOTH in the tool_result and in
+			// message.files; newer ones only in the tool_result. Track what the tool path actually
+			// rendered so the file loop below can skip the duplicate. Recorded only on success, so
+			// a failed download still falls back to the file entry (which resolves via a different
+			// URL and may well work).
+			const renderedImageUuids = new Set();
+
 			let contentHtml = '';
 			for (const content of message.content) {
 				if (content.type === 'thinking') {
@@ -632,13 +733,38 @@
 					contentHtml += `<details class="thinking-block"><summary>${esc(summaryText)}</summary><pre class="thinking-content">${esc(content.thinking || '')}</pre></details>`;
 				} else if (content.type === 'text') {
 					contentHtml += `<div class="text-content">${marked.parse(content.text || '')}</div>`;
+				} else if (content.type === 'tool_use') {
+					const result = toolResultsById.get(content.id);
+					contentHtml += renderToolBlockHtml(content, result);
+
+					// Emitted after (not inside) the block so the image stays visible without the
+					// reader having to expand anything, and lands inline where the tool ran rather
+					// than with the file pills at the end of the message.
+					for (const item of result?.content || []) {
+						if (item.type !== 'image' || !item.file_uuid || !orgId) continue;
+						try {
+							await paceDownload();
+							const image = await downloadGeneratedImage(orgId, item.file_uuid);
+							if (image) {
+								contentHtml += `<img class="tool-image" src="${image.dataUri}" alt="${esc(content.name || 'Generated image')}">`;
+								renderedImageUuids.add(item.file_uuid);
+							}
+						} catch (e) {
+							// One unavailable image shouldn't sink the whole export.
+							console.error('[Exporter] Failed to embed generated image:', e);
+						}
+					}
 				}
+				// tool_result is consumed via its tool_use above
 			}
 
 			// Download files sequentially with delay to avoid rate limiting
 			const fileResults = [];
 			for (let fi = 0; fi < message.files.length; fi++) {
 				const file = message.files[fi];
+				// Already shown inline by the tool-result path above — don't embed it twice
+				// (and don't pay for the download again).
+				if (file.file_uuid && renderedImageUuids.has(file.file_uuid)) continue;
 				if (file instanceof ClaudeAttachment) {
 					const b64 = btoa(unescape(encodeURIComponent(file.extracted_content || '')));
 					const mimeType = mime.getType(file.file_name) || 'text/plain';
@@ -647,25 +773,19 @@
 				}
 
 				try {
+					await paceDownload();
 					const blob = await file.download();
 					if (!blob) {
 						fileResults.push(`<span class="file-pill">File: ${esc(file.file_name)}</span>`);
 						continue;
 					}
 
-					const dataUri = await new Promise(resolve => {
-						const reader = new FileReader();
-						reader.onloadend = () => resolve(reader.result);
-						reader.readAsDataURL(blob);
-					});
+					const dataUri = await blobToDataUri(blob);
 
 					if (file.file_kind === 'image') {
 						fileResults.push(`<img src="${dataUri}" alt="${esc(file.file_name)}">`);
 					} else {
 						fileResults.push(`<a class="file-pill" href="${dataUri}" download="${esc(file.file_name)}">File: ${esc(file.file_name)}</a>`);
-					}
-					if (fi < message.files.length - 1) {
-						await new Promise(r => setTimeout(r, 200));
 					}
 				} catch (e) {
 					fileResults.push(`<span class="file-pill">File: ${esc(file.file_name)}</span>`);
