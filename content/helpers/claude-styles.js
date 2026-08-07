@@ -1595,28 +1595,24 @@ const ButtonBar = {
 		}
 	},
 
-	// Native overlays pinned to the viewport (the "Use incognito" ghost button is `fixed right-3`,
-	// and lives in the content pane rather than the header) take up no space in the header's flex
-	// row, so our rightmost button ends up underneath them. Probe what actually covers our right
-	// edge and reserve exactly that much — measuring beats hardcoding a width or a selector, since
-	// which overlay is present varies by page and by client.
+	// The "Use incognito" ghost button is `fixed right-3` and lives in the content pane rather than
+	// the header, so it takes up no space in the header's flex row and our rightmost button ends up
+	// underneath it. It's the only overlay that needs compensating for, so target it directly — the
+	// `look-around` class on its icon is the same handle homeWeb's legacy anchor uses.
 	_updateInlineOffset() {
 		const container = this._container;
 		if (!container) return;
 
 		container.style.marginRight = '';           // measure unshifted, so the result is idempotent
+
+		const ghost = document.querySelector('[class*="look-around"]')?.closest('.fixed');
+		if (!ghost) return;
+
 		const rect = container.getBoundingClientRect();
-		if (!rect.width) return;
+		const ghostRect = ghost.getBoundingClientRect();
+		if (!rect.width || !ghostRect.width) return;
 
-		let overlayLeft = Infinity;
-		for (const el of document.elementsFromPoint(rect.right - 2, rect.top + rect.height / 2)) {
-			if (el === container || container.contains(el) || el.contains(container)) continue;
-			if (getComputedStyle(el).position !== 'fixed') continue;
-			overlayLeft = Math.min(overlayLeft, el.getBoundingClientRect().left);
-		}
-		if (overlayLeft === Infinity) return;
-
-		const overlap = rect.right - overlayLeft;
+		const overlap = rect.right - ghostRect.left;
 		if (overlap > 0) container.style.marginRight = Math.ceil(overlap + 4) + 'px';
 	},
 
