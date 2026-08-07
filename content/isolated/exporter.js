@@ -185,8 +185,127 @@
 		return [header, ...lines].map(entry => JSON.stringify(entry)).join('\n') + '\n';
 	}
 
-	function formatLibrechatExport(conversationData, messages, conversationId) {
-		const processedMessages = messages.map((msg) => {
+	//#region LibreChat tool calls
+
+	// LibreChat hard-codes these tool names to purpose-built renderers that read from their own
+	// context/schema instead of the tool call's `output` string (see Part.tsx). A Claude tool that
+	// happens to share a name would render as an empty card, so it gets suffixed instead.
+	const LIBRECHAT_RESERVED_TOOL_NAMES = new Set([
+		'web_search', 'bash_tool', 'read_file', 'create_file', 'edit_file',
+		'file_search', 'retrieval', 'skill', 'subagent', 'execute_code'
+	]);
+
+	// LibreChat names MCP tools `${tool}_mcp_${server}` (its mcp_delimiter is '_mcp_'); Claude names
+	// them `Server:tool`. Translating gets us LibreChat's MCP chip and server icon, and the result
+	// can never collide with the reserved names above.
+	function toLibrechatToolName(name) {
+		const sep = name.indexOf(':');
+		if (sep > 0 && sep < name.length - 1) {
+			return `${name.slice(sep + 1)}_mcp_${name.slice(0, sep)}`;
+		}
+		return LIBRECHAT_RESERVED_TOOL_NAMES.has(name) ? `${name}_claude` : name;
+	}
+
+	// Claude stores web_search/web_fetch results as `knowledge` stubs — title, url and favicon
+	// metadata, but never the retrieved page text — so there is nothing faithful to export for them.
+	// Gating on the content types we can actually represent (rather than a tool-name blocklist)
+	// drops those automatically and degrades correctly for tools we haven't seen yet.
+	function isExportableToolResult(result) {
+		return (result?.content || []).some(item => item.type === 'text' || item.type === 'image');
+	}
+
+	function blobToDataUri(blob) {
+		return new Promise((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onloadend = () => resolve(reader.result);
+			reader.onerror = () => reject(reader.error || new Error('Failed to read blob'));
+			reader.readAsDataURL(blob);
+		});
+	}
+
+	// Resolves to null rather than throwing — a missing size just means we skip the attachment,
+	// since LibreChat needs real dimensions to render one inline.
+	function getImageSize(blob) {
+		return new Promise((resolve) => {
+			const url = URL.createObjectURL(blob);
+			const img = new Image();
+			img.onload = () => {
+				const size = { width: img.naturalWidth, height: img.naturalHeight };
+				URL.revokeObjectURL(url);
+				resolve(size.width && size.height ? size : null);
+			};
+			img.onerror = () => {
+				URL.revokeObjectURL(url);
+				resolve(null);
+			};
+			img.src = url;
+		});
+	}
+
+	// LibreChat only renders an image inline when its filename carries one of these extensions
+	// (its imageExtRegex). Anything outside the set degrades to a download chip no matter what we
+	// do, so an unexpected format is better skipped than mislabelled.
+	const LIBRECHAT_IMAGE_EXTENSIONS = {
+		'image/jpeg': 'jpg',
+		'image/png': 'png',
+		'image/gif': 'gif',
+		'image/webp': 'webp',
+		'image/heic': 'heic',
+		'image/heif': 'heif'
+	};
+
+	// Tool-generated images never appear in msg.files (that only carries user uploads), so the
+	// file_uuid on the tool_result is the only handle we get. /preview is the sole endpoint that
+	// serves them — the bare file URL and the usual /document, /content and /download variants all
+	// 404 — and it re-encodes to webp regardless of what the tool originally produced, so the
+	// filename is derived from the bytes we actually receive rather than from any declared name.
+	async function buildGeneratedImageAttachment(orgId, fileUuid, toolCallId, messageId, conversationId) {
+		const file = new ClaudeFile({
+			file_uuid: fileUuid,
+			file_name: fileUuid,
+			file_kind: 'image',
+			preview_url: `https://claude.ai/api/${orgId}/files/${fileUuid}/preview`
+		});
+
+		const blob = await file.download();
+		if (!blob) return null;
+
+		const mimeType = (blob.type || '').split(';')[0].trim();
+		const extension = LIBRECHAT_IMAGE_EXTENSIONS[mimeType];
+		if (!extension) return null;
+
+		// LibreChat needs the filename extension, width, height and filepath ALL present to render
+		// an attachment inline (isImageAttachment); missing any one silently degrades it to a
+		// download chip, so bail out rather than emit a half-populated attachment.
+		const size = await getImageSize(blob);
+		if (!size) return null;
+
+		return {
+			file_id: fileUuid,
+			filename: `${fileUuid}.${extension}`,
+			filepath: await blobToDataUri(blob),
+			type: mimeType,
+			width: size.width,
+			height: size.height,
+			bytes: blob.size,
+			source: 'local',
+			object: 'file',
+			context: 'image_generation',
+			toolCallId,
+			messageId,
+			conversationId
+		};
+	}
+	//#endregion
+
+	async function formatLibrechatExport(conversationData, messages, conversationId, options = {}, loadingModal = null) {
+		const includeImages = options.includeImages ?? false;
+		// Only needed to build preview URLs; skip the lookup entirely when images are off.
+		const orgId = includeImages ? getOrgId() : null;
+		let imagesDownloaded = 0;
+
+		const processedMessages = [];
+		for (const msg of messages) {
 			// Convert attachments to LibreChat file format
 			const files = [];
 			let attachmentText = '';
@@ -216,8 +335,18 @@
 				}
 			}
 
-			// Build content array with only think and text types
+			// Claude emits a tool_use and its tool_result as sibling blocks in the same message,
+			// so results can be paired up by id without looking at neighbouring messages.
+			const toolResultsById = new Map();
+			for (const item of msg.content) {
+				if (item.type === 'tool_result' && item.tool_use_id) {
+					toolResultsById.set(item.tool_use_id, item);
+				}
+			}
+
+			// Build content array: think, text, and exportable tool calls
 			const content = [];
+			const imageAttachments = [];
 			for (const item of msg.content) {
 				if (item.type === 'thinking') {
 					content.push({
@@ -229,8 +358,48 @@
 						type: 'text',
 						text: item.text || ''
 					});
+				} else if (item.type === 'tool_use') {
+					// A tool_use with no result (interrupted generation) has nothing to show, and
+					// one whose result we can't represent is dropped wholesale — see
+					// isExportableToolResult.
+					const result = toolResultsById.get(item.id);
+					if (!result || !isExportableToolResult(result)) continue;
+
+					content.push({
+						type: 'tool_call',
+						tool_call: {
+							id: item.id,
+							name: toLibrechatToolName(item.name || ''),
+							args: JSON.stringify(item.input ?? {}),
+							type: 'tool_call',
+							progress: 1,
+							output: (result.content || [])
+								.filter(c => c.type === 'text')
+								.map(c => c.text || '')
+								.join('\n')
+						}
+					});
+
+					if (!includeImages || !orgId) continue;
+					for (const resultItem of result.content || []) {
+						if (resultItem.type !== 'image' || !resultItem.file_uuid) continue;
+						// Sequential with a short gap, matching the HTML export's file downloads,
+						// so a bulk export doesn't trip rate limiting.
+						if (imagesDownloaded > 0) await new Promise(r => setTimeout(r, 200));
+						imagesDownloaded++;
+						loadingModal?.setContent(createLoadingContent(`Downloading generated image ${imagesDownloaded}...`));
+						try {
+							const attachment = await buildGeneratedImageAttachment(
+								orgId, resultItem.file_uuid, item.id, msg.uuid, conversationId
+							);
+							if (attachment) imageAttachments.push(attachment);
+						} catch (e) {
+							// An image that won't download shouldn't sink the whole export.
+							console.error('[Exporter] Failed to embed generated image:', e);
+						}
+					}
 				}
-				// Skip all other types (tool_use, tool_result, etc.)
+				// Skip everything else (tool_result is consumed above)
 			}
 
 
@@ -262,8 +431,12 @@
 				message.files = files;
 			}
 
-			return message;
-		});
+			if (imageAttachments.length > 0) {
+				message.attachments = imageAttachments;
+			}
+
+			processedMessages.push(message);
+		}
 
 		return JSON.stringify({
 			title: conversationData.name,
@@ -618,7 +791,7 @@
 			case 'jsonl':
 				return formatJsonlExport(conversationData, messages, conversationId);
 			case 'librechat':
-				return formatLibrechatExport(conversationData, messages, conversationId);
+				return formatLibrechatExport(conversationData, messages, conversationId, options, loadingModal);
 			case 'raw':
 				return formatRawExport(conversationData, messages, conversationId);
 			case 'html':
@@ -1650,7 +1823,7 @@
 		const content = document.createElement('div');
 
 		// Variables to hold references (may not be created)
-		let formatSelect, toggleInput, thinkingToggleInput, attachmentsToggleInput, dateInput;
+		let formatSelect, toggleInput, thinkingToggleInput, attachmentsToggleInput, imagesToggleInput, dateInput;
 
 		//#region Export section (always shown, context-aware)
 		{
@@ -1741,6 +1914,17 @@
 			attachmentsOption.appendChild(attachmentsToggleContainer);
 			content.appendChild(attachmentsOption);
 
+			// Generated images option (for librechat export). Off by default — each image is
+			// downloaded and inlined as a base64 data URI, which inflates the JSON substantially.
+			const imagesOption = document.createElement('div');
+			imagesOption.id = 'imagesOption';
+			imagesOption.className = 'mb-4 hidden';
+
+			const { container: imagesToggleContainer, input: imagesInput } = createClaudeToggle('Include generated images', false);
+			imagesToggleInput = imagesInput;
+			imagesOption.appendChild(imagesToggleContainer);
+			content.appendChild(imagesOption);
+
 			// Date filter option (bulk export only)
 			const dateOption = document.createElement('div');
 			dateOption.className = 'mb-4' + (isInConversation ? ' hidden' : '');
@@ -1759,6 +1943,7 @@
 			treeOption.classList.toggle('hidden', !['librechat', 'raw', 'html', 'zip'].includes(initialFormat));
 			thinkingOption.classList.toggle('hidden', initialFormat !== 'md');
 			attachmentsOption.classList.toggle('hidden', initialFormat !== 'md');
+			imagesOption.classList.toggle('hidden', initialFormat !== 'librechat');
 			syncCopyEnabled();
 
 			// Update option visibility on select change
@@ -1767,6 +1952,7 @@
 				treeOption.classList.toggle('hidden', !['librechat', 'raw', 'html', 'zip'].includes(format));
 				thinkingOption.classList.toggle('hidden', format !== 'md');
 				attachmentsOption.classList.toggle('hidden', format !== 'md');
+				imagesOption.classList.toggle('hidden', format !== 'librechat');
 				toggleInput.checked = ['html', 'zip'].includes(format);
 				syncCopyEnabled();
 			};
@@ -1775,7 +1961,8 @@
 			exportButton.onclick = async () => {
 				const exportOptions = {
 					includeThinking: thinkingToggleInput?.checked ?? true,
-					includeAttachments: attachmentsToggleInput?.checked ?? false
+					includeAttachments: attachmentsToggleInput?.checked ?? false,
+					includeImages: imagesToggleInput?.checked ?? false
 				};
 
 				if (isInConversation) {
@@ -1823,7 +2010,8 @@
 
 				const exportOptions = {
 					includeThinking: thinkingToggleInput?.checked ?? true,
-					includeAttachments: attachmentsToggleInput?.checked ?? false
+					includeAttachments: attachmentsToggleInput?.checked ?? false,
+					includeImages: imagesToggleInput?.checked ?? false
 				};
 
 				const loadingModal = createLoadingModal('Copying...');
