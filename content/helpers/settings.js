@@ -83,12 +83,24 @@ function _resolveDef(keyOrDef) {
 	return typeof keyOrDef === 'string' ? _settingsDefinitions[keyOrDef] : keyOrDef;
 }
 
+// Deep copy via JSON — every stored setting is JSON-safe by construction (it has to survive the
+// structured clone into IndexedDB). JSON specifically, because the built-in belongs to *our*
+// compartment, so the copy is always an extension-side object whichever side the input came from.
+// That matters on Firefox: IndexedDB opened from a content script belongs to the page, so rows read
+// back are Xray-wrapped page objects, and assigning an extension-side object into one throws
+// "Not allowed to define cross-origin object as property on [Object] or [Array] XrayWrapper".
+// That is exactly what savePreset (presets[id] = {...}) and saveBookmarks do.
+function _deepCopy(value) {
+	if (value === null || typeof value !== 'object') return value;
+	return JSON.parse(JSON.stringify(value));
+}
+
 function _resolveDefault(keyOrDef) {
 	const def = _resolveDef(keyOrDef);
 	if (!def) return undefined;
 	// Clone object defaults — callers mutate what get() hands back (e.g. banner-watcher deletes
 	// expired flags), and handing out the definition's literal would poison it for the session.
-	return (def.default && typeof def.default === 'object') ? structuredClone(def.default) : def.default;
+	return _deepCopy(def.default);
 }
 
 // Which backend a key uses. Unknown keys (the MAIN-world bridge accepts raw strings) default to
@@ -211,7 +223,8 @@ if (_isIsolatedWorld) {
 			if (result[key] !== undefined) return result[key];
 		} else {
 			const row = await _settingsDB.settings.get(key);
-			if (row && row.value !== undefined) return row.value;
+			// Copy: the row belongs to the page's compartment, and callers mutate what they get back.
+			if (row && row.value !== undefined) return _deepCopy(row.value);
 		}
 		return _resolveDefault(keyOrDef);
 	};
