@@ -650,7 +650,11 @@
 		return `<details class="tool-block${errorClass}"><summary>${esc(label)}${nameTag}${failedTag}</summary>${body.join('')}</details>`;
 	}
 
-	async function formatHtmlExport(conversationData, messages, conversationId) {
+	async function formatHtmlExport(conversationData, messages, conversationId, options = {}) {
+		// Defaults ON here, unlike the LibreChat export — HTML's whole point is fidelity, so the
+		// toggle is an escape hatch from size/download time rather than an opt-in.
+		const includeImages = options.includeImages ?? true;
+
 		// Configure marked to use highlight.js for code blocks
 		marked.use({
 			breaks: true,
@@ -741,7 +745,7 @@
 					// reader having to expand anything, and lands inline where the tool ran rather
 					// than with the file pills at the end of the message.
 					for (const item of result?.content || []) {
-						if (item.type !== 'image' || !item.file_uuid || !orgId) continue;
+						if (!includeImages || item.type !== 'image' || !item.file_uuid || !orgId) continue;
 						try {
 							await paceDownload();
 							const image = await downloadGeneratedImage(orgId, item.file_uuid);
@@ -769,6 +773,13 @@
 					const b64 = btoa(unescape(encodeURIComponent(file.extracted_content || '')));
 					const mimeType = mime.getType(file.file_name) || 'text/plain';
 					fileResults.push(`<a class="file-pill" href="data:${mimeType};base64,${b64}" download="${esc(file.file_name)}">File: ${esc(file.file_name)}</a>`);
+					continue;
+				}
+
+				// Images dominate an export's size and download time. With them off, keep the record
+				// of what was attached without paying for the bytes — or for the pacing delay.
+				if (!includeImages && file.file_kind === 'image') {
+					fileResults.push(`<span class="file-pill">File: ${esc(file.file_name)}</span>`);
 					continue;
 				}
 
@@ -915,7 +926,7 @@
 			case 'raw':
 				return formatRawExport(conversationData, messages, conversationId);
 			case 'html':
-				return formatHtmlExport(conversationData, messages, conversationId);
+				return formatHtmlExport(conversationData, messages, conversationId, options);
 			case 'zip':
 				return formatZipExport(conversationData, messages, conversationId, loadingModal);
 			default:
@@ -2034,13 +2045,16 @@
 			attachmentsOption.appendChild(attachmentsToggleContainer);
 			content.appendChild(attachmentsOption);
 
-			// Generated images option (for librechat export). Off by default — each image is
-			// downloaded and inlined as a base64 data URI, which inflates the JSON substantially.
+			// Images option (librechat + html). Every image is downloaded and inlined as a base64
+			// data URI, so it dominates both file size and export time. Off by default for
+			// librechat, where the export is otherwise a small JSON file; on by default for html,
+			// which already embeds everything else and is meant to be the high-fidelity archive.
 			const imagesOption = document.createElement('div');
 			imagesOption.id = 'imagesOption';
 			imagesOption.className = 'mb-4 hidden';
 
-			const { container: imagesToggleContainer, input: imagesInput } = createClaudeToggle('Include generated images', false);
+			const initialImagesDefault = selectedFormat.split('_')[0] === 'html';
+			const { container: imagesToggleContainer, input: imagesInput } = createClaudeToggle('Include images', initialImagesDefault);
 			imagesToggleInput = imagesInput;
 			imagesOption.appendChild(imagesToggleContainer);
 			content.appendChild(imagesOption);
@@ -2063,7 +2077,7 @@
 			treeOption.classList.toggle('hidden', !['librechat', 'raw', 'html', 'zip'].includes(initialFormat));
 			thinkingOption.classList.toggle('hidden', initialFormat !== 'md');
 			attachmentsOption.classList.toggle('hidden', initialFormat !== 'md');
-			imagesOption.classList.toggle('hidden', initialFormat !== 'librechat');
+			imagesOption.classList.toggle('hidden', !['librechat', 'html'].includes(initialFormat));
 			syncCopyEnabled();
 
 			// Update option visibility on select change
@@ -2072,8 +2086,9 @@
 				treeOption.classList.toggle('hidden', !['librechat', 'raw', 'html', 'zip'].includes(format));
 				thinkingOption.classList.toggle('hidden', format !== 'md');
 				attachmentsOption.classList.toggle('hidden', format !== 'md');
-				imagesOption.classList.toggle('hidden', format !== 'librechat');
+				imagesOption.classList.toggle('hidden', !['librechat', 'html'].includes(format));
 				toggleInput.checked = ['html', 'zip'].includes(format);
+				imagesToggleInput.checked = format === 'html';
 				syncCopyEnabled();
 			};
 
