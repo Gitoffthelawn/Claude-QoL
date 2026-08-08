@@ -1,2 +1,2 @@
-Fix advanced edit being broken due to UI change
-Fix exports showing outdated branches
+Fix UI issues
+Support exporting images and toolcalls for librechat
