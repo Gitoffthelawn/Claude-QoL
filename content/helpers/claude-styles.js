@@ -7,10 +7,10 @@ document.documentElement.setAttribute('data-claude-qol-installed', 'true');
 
 const CLAUDE_CLASSES = {
 	// Buttons
-	ICON_BTN: 'inline-flex items-center justify-center relative shrink-0 ring-offset-2 ring-offset-bg-300 ring-accent-main-100 focus-visible:outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-50 disabled:shadow-none disabled:drop-shadow-none text-text-200 border-transparent transition-colors font-styrene active:bg-bg-400 h-9 w-9 rounded-md active:scale-95',
+	ICON_BTN: 'inline-flex items-center justify-center relative shrink-0 ring-offset-2 ring-offset-bg-300 ring-accent-200 focus-visible:outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-50 disabled:shadow-none disabled:drop-shadow-none text-text-200 border-transparent transition-colors active:bg-bg-400 h-9 w-9 rounded-md active:scale-95',
 	ICON_BTN_MSG: 'inline-flex items-center justify-center relative shrink-0 can-focus select-none disabled:pointer-events-none disabled:opacity-50 disabled:shadow-none disabled:drop-shadow-none border-transparent transition font-base duration-300 ease-[cubic-bezier(0.165,0.85,0.45,1)] h-6 w-6 rounded !text-muted active:scale-95 group/btn',
-	BTN_PRIMARY: 'inline-flex items-center justify-center px-4 py-2 font-base-bold bg-text-000 text-bg-000 rounded hover:bg-text-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-w-[5rem] h-9',
-	BTN_SECONDARY: 'inline-flex items-center justify-center px-4 py-2 hover:bg-bg-500/40 rounded transition-colors min-w-[5rem] h-9 text-text-000 font-base-bold border-0.5 border-border-200',
+	BTN_PRIMARY: 'inline-flex items-center justify-center px-4 py-2 font-base-bold bg-fill-primary text-on-primary rounded hover:bg-fill-primary-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-w-[5rem] h-9',
+	BTN_SECONDARY: 'inline-flex items-center justify-center px-4 py-2 hover:bg-fill-ghost-hover rounded transition-colors min-w-[5rem] h-9 text-text-000 font-base-bold border-0.5 border-border-200',
 
 	// Modal
 	MODAL_BACKDROP: 'fixed inset-0 flex items-center justify-center z-50',
@@ -20,7 +20,7 @@ const CLAUDE_CLASSES = {
 	// Form elements
 	INPUT: 'w-full p-2 rounded bg-bg-200 text-text-100 border border-border-300 hover:border-border-200',
 	SELECT: 'w-full p-2 rounded bg-bg-200 text-text-100 border border-border-300 hover:border-border-200 cursor-pointer',
-	CHECKBOX: 'mr-2 rounded border-border-300 accent-accent-main-100',
+	CHECKBOX: 'mr-2 rounded border-border-300 accent-clay-emphasized',
 	LABEL: 'block text-sm font-medium text-text-200 mb-1',
 
 	// Text
@@ -41,8 +41,8 @@ const CLAUDE_CLASSES = {
 	LIST_ITEM: 'p-3 rounded bg-bg-200 border border-border-300 hover:bg-bg-300 cursor-pointer transition-colors',
 };
 
-const spinnerStyles = document.createElement('style');
-spinnerStyles.textContent = `
+const toolboxStyles = document.createElement('style');
+toolboxStyles.textContent = `
 	@keyframes claude-modal-spin {
 		from { transform: rotate(0deg); }
 		to { transform: rotate(360deg); }
@@ -50,8 +50,16 @@ spinnerStyles.textContent = `
 	.claude-modal-spinner {
 		animation: claude-modal-spin 1s linear infinite;
 	}
+
+	/* claude.ai's Tailwind build purged the space-y-* utilities, but we still use
+	   them in list/stack layouts. Re-provide the sizes we rely on. Matches
+	   Tailwind's own output (--spacing is 0.25rem). */
+	.space-y-1 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.25rem; }
+	.space-y-2 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.5rem; }
+	.space-y-3 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.75rem; }
+	.space-y-4 > :not([hidden]) ~ :not([hidden]) { margin-top: 1rem; }
 `;
-if (document.head) document.head.appendChild(spinnerStyles);
+if (document.head) document.head.appendChild(toolboxStyles);
 
 // Component creators
 class ClaudeModal {
