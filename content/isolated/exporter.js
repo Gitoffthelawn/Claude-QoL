@@ -828,21 +828,26 @@
 			messagesHtml += `<div class="msg ${roleClass}" id="msg-${message.uuid}"${tsAttr} style="display:none"><div class="msg-header">${role}</div><div class="msg-body">${contentHtml}</div></div>\n`;
 		}
 
-		// Assemble from template
-		// Every replacement passes a FUNCTION rather than a string. With a string, the
-		// dollar sequences $& $` $' are substitution patterns: $` inserts everything
-		// before the match and $' everything after. Conversation text contains these
-		// routinely ($'\n' is ANSI-C shell quoting, $& appears in sed/awk/regex talk),
-		// which would splice the entire <head> — multi-megabyte embedded font CSS and
-		// all — into the body as raw text, and the viewer <script> into the middle of
-		// the messages. Passing a function disables $ processing entirely.
+		// Assemble from template in a SINGLE replace pass. Chained .replace() calls
+		// rescan the already-filled string, so a literal "{{RAW_TXT}}" inside the
+		// conversation text (e.g. a chat about this extension quoting the exporter's
+		// source) would steal the substitution from the real scaffold placeholder and
+		// splice raw text into the middle of the messages. One global pass scans only
+		// the template; callback output is never rescanned. The callback also disables
+		// $-pattern processing ($` $' $&), which would otherwise splice the template
+		// around any dollar sequences occurring in conversation text.
 		const template = await getExportTemplate();
-		const templateResult = template
-			.replace('{{TITLE}}', () => esc(title))
-			.replace('{{DEFAULT_LEAF}}', () => defaultLeaf)
-			.replace('{{MESSAGES}}', () => messagesHtml)
-			.replace('{{TREE_JSON}}', () => safeEmbed(JSON.stringify(treeJson)))
-			.replace('{{RAW_TXT}}', () => safeEmbed(rawTxt));
+		const templateValues = {
+			TITLE: esc(title),
+			DEFAULT_LEAF: defaultLeaf,
+			MESSAGES: messagesHtml,
+			TREE_JSON: safeEmbed(JSON.stringify(treeJson)),
+			RAW_TXT: safeEmbed(rawTxt),
+		};
+		const templateResult = template.replace(
+			/\{\{(TITLE|DEFAULT_LEAF|MESSAGES|TREE_JSON|RAW_TXT)\}\}/g,
+			(_, key) => templateValues[key]
+		);
 		// console.log(templateResult);
 		return templateResult;
 	}
