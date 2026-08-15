@@ -582,7 +582,9 @@
 		const fontMap = await extractFontDataUris();
 		let processedCss = css;
 		for (const [placeholder, dataUri] of fontMap) {
-			processedCss = processedCss.replaceAll(placeholder, dataUri);
+			// Function replacement, not a string: see the note on the template assembly
+			// below. Base64 payloads can contain $& and would otherwise self-splice.
+			processedCss = processedCss.replaceAll(placeholder, () => dataUri);
 		}
 
 		// Any placeholder we couldn't resolve (claude.ai renamed a family, moved the
@@ -596,16 +598,21 @@
 		}
 
 		_templateCache = EXPORT_SCAFFOLD
-			.replace('{{STYLESHEET}}', processedCss)
-			.replace('{{SCRIPT}}', js);
+			.replace('{{STYLESHEET}}', () => processedCss)
+			.replace('{{SCRIPT}}', () => js);
 
 		return _templateCache;
 	}
 
 	const _escEl = document.createElement('span');
 	function esc(str) {
+		// textContent -> innerHTML escapes & < > but NOT the double quote, and we
+		// interpolate this into attributes (alt, download, href). A filename or search
+		// result title containing a quote would otherwise close the attribute early and
+		// spill the rest into stray markup. Escaping it is harmless in text contexts,
+		// where &quot; just renders as a quote.
 		_escEl.textContent = str;
-		return _escEl.innerHTML;
+		return _escEl.innerHTML.replace(/"/g, '&quot;');
 	}
 
 	function safeEmbed(str) {
@@ -822,13 +829,20 @@
 		}
 
 		// Assemble from template
+		// Every replacement passes a FUNCTION rather than a string. With a string, the
+		// dollar sequences $& $` $' are substitution patterns: $` inserts everything
+		// before the match and $' everything after. Conversation text contains these
+		// routinely ($'\n' is ANSI-C shell quoting, $& appears in sed/awk/regex talk),
+		// which would splice the entire <head> — multi-megabyte embedded font CSS and
+		// all — into the body as raw text, and the viewer <script> into the middle of
+		// the messages. Passing a function disables $ processing entirely.
 		const template = await getExportTemplate();
 		const templateResult = template
-			.replace('{{TITLE}}', esc(title))
-			.replace('{{DEFAULT_LEAF}}', defaultLeaf)
-			.replace('{{MESSAGES}}', messagesHtml)
-			.replace('{{TREE_JSON}}', safeEmbed(JSON.stringify(treeJson)))
-			.replace('{{RAW_TXT}}', safeEmbed(rawTxt));
+			.replace('{{TITLE}}', () => esc(title))
+			.replace('{{DEFAULT_LEAF}}', () => defaultLeaf)
+			.replace('{{MESSAGES}}', () => messagesHtml)
+			.replace('{{TREE_JSON}}', () => safeEmbed(JSON.stringify(treeJson)))
+			.replace('{{RAW_TXT}}', () => safeEmbed(rawTxt));
 		// console.log(templateResult);
 		return templateResult;
 	}
