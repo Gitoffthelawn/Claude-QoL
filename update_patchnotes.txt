@@ -1,2 +1,2 @@
-Fix UI issues
-Support exporting images and toolcalls for librechat
+Fixed buttons to match new UI
+Fixed HTML export bugs
