@@ -511,7 +511,10 @@
 	let _templateCache = null;
 
 	async function extractFontDataUris() {
-		// Family names are compared lowercased with whitespace stripped ("Anthropic Sans" -> anthropicsans)
+		// Family names are compared with every non-alphanumeric character stripped, so
+		// both "Anthropic Sans" and "anthropic-sans" normalise to anthropicsans.
+		// claude.ai renamed these families from spaced to hyphenated; matching on
+		// letters/digits only keeps us working across either spelling.
 		const FONT_KEYS = {
 			'anthropicsans/normal': '{{FONT_SANS_NORMAL}}',
 			'anthropicsans/italic': '{{FONT_SANS_ITALIC}}',
@@ -543,7 +546,7 @@
 					const urlMatch = block.match(urlRegex);
 					if (!familyMatch || !urlMatch) continue;
 
-					const family = familyMatch[1].trim().toLowerCase().replace(/\s+/g, '');
+					const family = familyMatch[1].trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
 					const style = (styleMatch && styleMatch[1]) || 'normal';
 					const key = family + '/' + style;
 					const placeholder = FONT_KEYS[key];
@@ -578,8 +581,18 @@
 		// Embed fonts as data URIs
 		const fontMap = await extractFontDataUris();
 		let processedCss = css;
-		for (const [originalUrl, dataUri] of fontMap) {
-			processedCss = processedCss.replaceAll(originalUrl, dataUri);
+		for (const [placeholder, dataUri] of fontMap) {
+			processedCss = processedCss.replaceAll(placeholder, dataUri);
+		}
+
+		// Any placeholder we couldn't resolve (claude.ai renamed a family, moved the
+		// stylesheet, etc.) would otherwise ship as a literal url("{{FONT_...}}").
+		// Drop those @font-face blocks so the export falls back to the system stack
+		// declared alongside each family instead of emitting broken CSS.
+		const unresolved = processedCss.match(/\{\{FONT_[A-Z_]+\}\}/g);
+		if (unresolved) {
+			console.warn('Export: could not embed fonts', [...new Set(unresolved)].join(', '));
+			processedCss = processedCss.replace(/@font-face\s*\{[^{}]*\{\{FONT_[A-Z_]+\}\}[^{}]*\}\s*/g, '');
 		}
 
 		_templateCache = EXPORT_SCAFFOLD
