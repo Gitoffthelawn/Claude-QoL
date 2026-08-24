@@ -11,13 +11,15 @@
 
 	const CHECK_SVG = `<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="flex-shrink: 0;"><path d="M15.3 5.3a1 1 0 0 1 1.4 1.4l-8 8a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.4L8 12.58l7.3-7.3z"/></svg>`;
 
+	const MESSAGE_ACTIONS_SELECTOR = '[role="toolbar"][aria-label="Message actions"], [role="group"][aria-label="Message actions"], [data-cds="MessageActions"]';
+
 	function findContentBlockCopyButtons() {
 		const results = [];
 		const copyButtons = document.querySelectorAll('button[aria-label="Copy message"]');
 
 		for (const btn of copyButtons) {
 			if (btn.dataset.testid === 'action-bar-copy') continue;
-			if (btn.closest('[role="toolbar"][aria-label="Message actions"], [role="group"][aria-label="Message actions"]')) continue;
+			if (btn.closest(MESSAGE_ACTIONS_SELECTOR)) continue;
 			if (btn.nextElementSibling?.classList.contains(RICH_COPY_CLASS)) continue;
 
 			results.push(btn);
@@ -26,19 +28,39 @@
 		return results;
 	}
 
+	// Copy buttons in artifact/file action rows carry no aria-label or testid, just an
+	// icon-font glyph and a "Copy" label. Never assume a split dropdown's primary button
+	// is the copy one — that slot also holds actions like "Send via Gmail".
+	const COPY_ICON_GLYPH = '\ue056';
+
+	function isNativeCopyButton(btn) {
+		if (btn.classList.contains(RICH_COPY_CLASS)) return false;
+		if (btn.dataset.testid === 'action-bar-copy') return false;
+		// The message action bar has its own copy button, handled above.
+		if (btn.closest(MESSAGE_ACTIONS_SELECTOR)) return false;
+
+		const label = (btn.getAttribute('aria-label') || '').trim().toLowerCase();
+		if (label && label !== 'copy') return false;
+
+		const icon = btn.querySelector('[data-cds="Icon"]');
+		if (icon && icon.textContent === COPY_ICON_GLYPH) return true;
+
+		return (btn.textContent || '').trim().toLowerCase() === 'copy';
+	}
+
 	function findArtifactCopyButtons() {
 		const results = [];
-		const splitDropdowns = document.querySelectorAll('[data-cds="SplitDropdownButton"]');
 
-		for (const dropdown of splitDropdowns) {
-			const copyBtn = dropdown.querySelector('.contents > button');
-			if (!copyBtn) continue;
+		for (const copyBtn of document.querySelectorAll('button[data-cds="Button"]')) {
+			if (!isNativeCopyButton(copyBtn)) continue;
 
-			const parent = dropdown.parentElement;
+			// Sit next to the whole split dropdown when the copy button lives inside one.
+			const anchor = copyBtn.closest('[data-cds="SplitDropdownButton"]') || copyBtn;
+			const parent = anchor.parentElement;
 			if (!parent) continue;
 			if (parent.querySelector('.' + RICH_COPY_CLASS)) continue;
 
-			results.push({ copyBtn, dropdown });
+			results.push({ copyBtn, anchor });
 		}
 
 		return results;
@@ -117,34 +139,23 @@
 		return btn;
 	}
 
-	function createArtifactRichCopyButton(copyBtn, dropdown) {
-		const parent = dropdown.parentElement;
-		const siblingBtn = parent.querySelector(':scope > button[data-cds="Button"]');
+	function createArtifactRichCopyButton(copyBtn) {
+		const btn = copyBtn.cloneNode(true);
+		btn.className = copyBtn.className + ' ' + RICH_COPY_CLASS;
 
-		let btn;
-		if (siblingBtn) {
-			btn = siblingBtn.cloneNode(false);
-			btn.className = siblingBtn.className + ' ' + RICH_COPY_CLASS;
-
-			const iconSpans = siblingBtn.querySelectorAll(':scope > span');
-			for (const span of iconSpans) {
-				const clone = span.cloneNode(true);
-				if (clone.getAttribute('aria-hidden') !== 'true' || clone.querySelector('[data-cds="Icon"]')) {
-					const iconEl = clone.querySelector('[data-cds="Icon"]');
-					if (iconEl) {
-						iconEl.innerHTML = RICH_COPY_SVG;
-					} else if (!clone.classList.contains('absolute')) {
-						clone.innerHTML = RICH_COPY_SVG;
-					}
-				}
-				btn.appendChild(clone);
-			}
+		const iconEl = btn.querySelector('[data-cds="Icon"]');
+		if (iconEl) {
+			iconEl.innerHTML = RICH_COPY_SVG;
+		} else {
+			btn.innerHTML = RICH_COPY_SVG;
 		}
 
-		if (!btn) {
-			btn = document.createElement('button');
-			btn.className = RICH_COPY_CLASS;
-			btn.innerHTML = RICH_COPY_SVG;
+		// Relabel so it doesn't read as a second "Copy" right next to the native one.
+		const labelNode = [...btn.querySelectorAll('span')]
+			.flatMap((span) => [...span.childNodes])
+			.find((node) => node.nodeType === Node.TEXT_NODE && node.nodeValue.trim());
+		if (labelNode) {
+			labelNode.nodeValue = 'Copy rich text';
 		}
 
 		btn.setAttribute('aria-label', 'Copy as rich text');
@@ -170,9 +181,9 @@
 		}
 
 		const artifactTargets = findArtifactCopyButtons();
-		for (const { copyBtn, dropdown } of artifactTargets) {
-			const richBtn = createArtifactRichCopyButton(copyBtn, dropdown);
-			dropdown.insertAdjacentElement('afterend', richBtn);
+		for (const { copyBtn, anchor } of artifactTargets) {
+			const richBtn = createArtifactRichCopyButton(copyBtn);
+			anchor.insertAdjacentElement('afterend', richBtn);
 		}
 	}
 
