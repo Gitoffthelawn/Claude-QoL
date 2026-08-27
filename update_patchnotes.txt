@@ -1,2 +1,1 @@
-Fixed buttons to match new UI
-Fixed HTML export bugs
+Fixed "Copy as rich text" showing up in the wrong places
