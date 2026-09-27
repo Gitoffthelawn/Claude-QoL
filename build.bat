@@ -1,7 +1,8 @@
 @echo off
 
-REM Not part of the extension: the debug mirrors and the common submodule's tooling and docs.
-set IGNORE="debug/**" "common/scripts/**" "common/README.md"
+REM Not part of the extension: the debug mirrors, the common submodule's tooling and docs, and the
+REM Photoshop sources of the icons and store images.
+set IGNORE="debug/**" "common/scripts/**" "common/README.md" "**/*.psd"
 
 REM Stop unless common/ is exactly the pinned commit, and that matches common's main. The check
 REM lives in the submodule, so check it out first if it never was (only then: never undo a checkout).
