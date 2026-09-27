@@ -1,2 +1,4 @@
-Support Opus 5.5
-UI improvements on mobile/vertical layouts
+TODO: Support the merged cowork/chat experience. The API has changed, so I need it on my account before I can do this.
+Added support for all claude.ai UI languages.
+A lot of bugfixes.
+Mostly a refactor of a lot of code, so it's shared between this extension and the Usage Tracker.
