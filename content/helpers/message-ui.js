@@ -21,7 +21,7 @@ function findMessageControls(messageElement) {
 
 // Retrieve all message elements from the UI
 function getUIMessages() {
-	const assistantMessages = Array.from(document.querySelectorAll('.font-claude-response, .\\!font-claude-response'))
+	const assistantMessages = Array.from(document.querySelectorAll('.font-claude-response, .\\!font-claude-response, [data-testid="assistant-message"]'))
 		.filter(el => !el.classList.contains('text-text-300'));
 	const userMessages = Array.from(document.querySelectorAll('.font-user-message, .\\!font-user-message, [data-testid="user-message"]'));
 

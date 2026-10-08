@@ -145,6 +145,12 @@ const pageLayouts = {
 			return isProjectPage();
 		},
 		getAnchor() {
+			// dframe layout: native buttons (search, pin, Share) live in the header actions slot.
+			// The legacy selector below now matches the model picker row under the composer.
+			const actionsSlot = document.querySelector('#dframe-header-actions-slot');
+			if (actionsSlot) {
+				return { parent: actionsSlot.parentElement, referenceNode: actionsSlot, mode: 'inline', fitToHeader: true };
+			}
 			const nativeActions = document.querySelector('.flex.items-center.gap-1.ml-auto');
 			if (!nativeActions) return null;
 			const starWrapper = nativeActions.querySelector('[data-state]');
