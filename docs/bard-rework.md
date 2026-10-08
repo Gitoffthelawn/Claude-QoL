@@ -125,7 +125,11 @@ with the header `conversation_id` = **a new uuid we choose**.
 
 ## Toolkit (common)
 
-All in common's versioned `net.js` + `bard-schema.js`. Nothing is built yet.
+All in common's versioned `net.js` + `bard-schema.js`. **Built:** claude-ext-common #23 (`cc476c8`, net.js VERSION 4), pinned on this branch in `988e9bd`. Besides what's listed below, it also has `readProtoRequestBody` / `withProtoRequestBody` / `protoResponse`.
+
+Precedence rules:
+- `encodeBard` writes `$unknown` *before* the known fields, so an explicitly set field beats retained data in the same oneof.
+- `rewriteConnectStream` delivers frames `inject()` already accepted even if the source ends at that moment, and a throwing `onError` can't break fail-open.
 
 - **`decodeBard(type, bytes, { keepUnknown: true })`.** Every decoded message object carries `$unknown`, the raw records the schema didn't recognise. It's a plain property, so it survives `postMessage`/`structuredClone`.
 - **`encodeBard(type, obj)`.** The mirror of `decodeBard`'s JSON shape, writing `$unknown` back. It also builds new messages from scratch.
