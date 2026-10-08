@@ -1,0 +1,193 @@
+# QoL on the merged-experience API: reference
+
+Findings from the "big questions" exploration (2026-10-08 to 2026-10-09), all verified live in Chrome
+against a merged account (with Claude Usage Tracker loaded), plus the decisions taken. This is the
+spec the rework branch builds against. Raw API notes (calls, event shapes, compaction, context
+costs) live in `common/scripts/bard/README.md`; this file covers what QoL can do with that API and
+how.
+
+## Decisions
+
+| # | Decision |
+| --- | --- |
+| D1 | **The rework is merged-only.** No legacy code paths in the new code. Reads move to `ReadConversation` too. |
+| D2 | **Process:** a long-lived rework branch, with PRs into that branch, merged to `main` when ready, timed to the rollout. The current release keeps serving legacy accounts until then. |
+| D3 | The reworked version **detects legacy accounts** (RPC 403, or no `StreamTimeline`) and shows a notice instead of half-working features. |
+| D4 | **Protobuf toolkit in common** (`net.js` + `bard-schema.js`, versioned): decode with unknown fields kept, then edit, then encode. Fields are referenced **by name**, never by number. See [Toolkit](#toolkit-common). |
+| D5 | **Message identity = `data-turn-key`**, plus the tree rule for `-hub-reply` keys. **Zero React internals** in production. |
+| D6 | **Full-load patch** (all messages loaded at page load), as a toggle in the overall Settings panel, **default on**. |
+| D7 | Navigation's "continue on an old branch" UX: our own banner next to claude.ai's "earlier version" banner (see [Branches](#branches-and-navigation)). |
+
+## Wire basics
+
+- Endpoint: `POST /claudeai-rpc/anthropic.bard.api.v1alpha.ConversationService/<Method>`.
+- **Unary calls** (`PerformAction`, `ReadConversation`, `ReadConversationHistory`): `content-type: application/proto` (or `application/json` with camelCase fields, which works for reads).
+- **Streaming** (`StreamTimeline`): `application/connect+proto`. Frames are `flags(1) + length(4, BE) + payload`, where flag `0x01` = gzip and `0x02` = end-of-stream (JSON trailers). We may re-emit frames uncompressed (flags 0); the client accepts them.
+- **Headers for our own calls from MAIN:** `content-type`, `connect-protocol-version: 1`, `x-organization-uuid: <org>`, `anthropic-client-platform: web_claude_ai`.
+  - These endpoints check `Origin`. Calls from the page are fine; extension/background contexts get 403 unless a declarativeNetRequest rule rewrites `Origin`.
+- **Our own `PerformAction`:** `{ header: { mutation_id: { session_id: 'sess_<ours>', version: 1 }, conversation_id, display_language }, <action> }`.
+  - A 200 only means accepted. **Success or failure arrives as a `mutation_ack` on the stream** (e.g. `stale_parent`, `invalid_leaf_target`).
+- **Our own `StreamTimeline`:** body = one frame holding `{ conversation_id, display_language }`. The first frame is the snapshot.
+- Merge semantics we rely on:
+  - A repeated singular field: last wins.
+  - A repeated embedded message (singular field): merged.
+  - A repeated field: appended.
+  - Separately, the client upserts content blocks and messages **by id** (last copy wins).
+
+## Rewriting what the page receives
+
+Hook `window.fetch` in MAIN, wrap the `StreamTimeline` body (frame by frame) and the
+`ReadConversationHistory` body (unary), and splice in extra or modified data.
+
+- **New content blocks** render, markdown included. A block reusing an existing id **replaces** it.
+- **Phantom messages:** fake `Message` + `DisplayGroup` (`GROUP_STYLE_INLINE`) + `ContentBlock` render as real rows ("Message 1 of N"), each with its own toolbar.
+  - **Negative indices** (`-2`, `-1`) work, so real messages keep their indices. Only the real root needs re-parenting (`parent_message_id` = the last phantom).
+  - They survive reconnects (the stream closes every ~5 s and reopens), live turns (send, stream, settle) and post-turn updates.
+- **Long chats:** the snapshot only holds the latest window (e.g. 30–122 messages). The root arrives in a `ReadConversationHistory` page (`ReadConversationHistoryResponse.update`), and the same splice works there.
+- **Client cache:** IndexedDB `claude-conversation-store` (`trees` + `meta`, keyed by conversation uuid) holds a legacy-shaped transcript (`hub_transcript` v2: `sender`, `parent_message_uuid`, typed content, `nOptions`, `siblingUuids`).
+  - It paints first on a cold load, and the stream replaces it ~100 ms later.
+  - It is written from client state, so injected content persists into it. Only the snapshot window is cached.
+  - **Delete those entries after any test run.**
+- **Timing:** `StreamTimeline` opens ~40–500 ms after navigation, so a `document_start` MAIN hook catches it in Chrome. Firefox is untested.
+
+## Rewriting what the page sends
+
+Append `encodeBard(partial SendMessage)` as field 2 of the `PerformActionRequest`, so it merges into
+`send_message`. Bodies may be gzip; send them plain and drop `content-encoding`. Nothing validates
+the body (`origin_nonce` is not a body checksum).
+
+| `send_message` field | Result |
+| --- | --- |
+| `text` (3) | Override accepted; the UI shows the server's version. |
+| `hidden_context` (23, repeated string) | Reaches the model as a `<system-reminder>` on that turn and **stays in context in later turns**. **Invisible** in the UI, the legacy tree and `ReadConversation`. **Survives the native fork.** Candidate for phantom history and per-chat instructions; we keep our own copy (export can't recover it). |
+| `inline_attachments` (15) | Injected text files are in context and shown on the message. |
+| `attachments` (4) | Re-attaching an existing file id works (same chat; across chats untested). **New binary files** work: upload with legacy `POST /api/<org>/upload` (FormData `file` + `client_upload_id`, returns `file_uuid` and `file_kind`), then reference `{ id, file_name, file_size, media_type }`. Tested with a PNG (`image`) and a 1-page PDF (`document`, 1,570 tokens/page). |
+| `parent_message_id` (5) | Any existing message works: the server branches there and **the UI follows**. `""` = new root (what a normal edit of the first message sends). An unknown id gets `stale_parent`, and the UI shows "Failed to send / Retry / Discard". |
+| `model` (7) | Override works on an existing chat and sticks; the picker updates. |
+| `client_tools` (16) | **The model calls tools we declare.** The stream shows a RUNNING block with `display_content.client_tool { tool_name, input_json, tool_use_id, origin_session_id, origin_version }` and the turn waits. We answer with `submit_client_tool_result (11) { tool_use_id, result_json }`, and the model uses the result. Browser-side tools for the model. |
+
+- A normal send carries **no** `parent_message_id` (the server continues its own leaf). The client *does* set it when sending from a branch that `set_current_leaf` just moved to.
+- Untested: `settings_update`, `answer_now`, `work_mode_override`, `chat_memory_mode`, `safety_controls`, `project_id`/`is_temporary`, Retry with an arbitrary parent, cross-chat attachment ids. Deliberately not probed: `eval_params_json` (looks internal).
+
+## Native fork
+
+`PerformAction` `continue_branch_as_new_chat (37) { source_conversation_id, through_message_id }`,
+with the header `conversation_id` = **a new uuid we choose**.
+
+- It works through **any** message, including hidden post-cutover branches.
+- **The model has the forked history in real context**, and `hidden_context` comes along.
+- **Copied:** messages with new ids (UUID v5-looking), original `created_at`, attachments (new file ids, content intact), the title and all conversation settings.
+- **Not copied:** the model (falls back to the default). There's no visible link back to the source.
+- It **only replaces summaryless forking**. Summary forks still need their own path.
+
+## Branches and navigation
+
+- **Both read paths keep the full tree:** `ReadConversation` equals the legacy GET (261 messages and 33 forks; 1,403 and 315).
+- **`Message.siblings_viewable` (25) gates the UI**, per fork group. It's true only for forks created before the account's cutover (here ~2026-10-07 01:35 UTC).
+  - Viewable forks show "N / M" with Previous/Next version in the toolbar (hover-revealed on older rows).
+  - Newer forks exist in the data but are hidden.
+  - **Splicing `siblings_viewable = true` onto every message brings the arrows back.**
+- **Switching versions is client-only** (no request). Viewing an older branch shows a banner: "You're viewing an earlier version · Continue in a new session · Back to latest version".
+  - The composer accepts text, but **Send is disabled**. Force-enabling the button does nothing; the handlers check the state themselves.
+  - Stable hooks: `[data-testid="hub-earlier-version-continue"]` and `[data-testid="hub-earlier-version-back"]`, inside `[data-cds="Banner"]` in a `cdsDockCard` above the composer. Send is `[data-testid="chat-input-send"]`.
+- **Setting the leaf** (it must be a true leaf, with no children):
+  - `PerformAction` `set_current_leaf (23)` works. A message with children gets `invalid_leaf_target` (on the stream only).
+  - **The open page follows live:** the banner goes, Send enables, and the view stays. The next send continues that branch, with the client setting `parent_message_id` itself.
+  - The legacy `PUT …/current_leaf_message_uuid` also sets the merged leaf (a message with children gets 400 "Current leaf message has unexpected children"). Not to be used, per D1.
+- **Planned UX (D7):** when the earlier-version banner appears, add our own banner, "QoL: Continue anyway?", with "(Files will not be rolled back)" only when the chat has `workspace_upgraded`. On click, `set_current_leaf` to the viewed branch's leaf: take the switched message's id (see [identity](#message-identity-in-the-dom)) and walk down the tree to its newest descendant.
+- **Why it's hidden (likely):** workspace chats have a linear sandbox filesystem (`/mnt/user-data`) that wouldn't roll back with the branch. The server still allows branching anywhere (edits and retries rely on it).
+
+## Message identity in the DOM
+
+- **Every row has `[data-turn-key]`**, rendered by the page, readable from ISOLATED, and updated in place on version switches.
+  - **User rows:** the message's own id.
+  - **Assistant rows:** their own id, except the **original reply to a merged-era send**, which is keyed `<parent user id>-hub-reply`. Retries and pre-merge replies use their own id, so every version of a reply has a distinct key.
+  - **`-hub-reply` resolves to the lowest-index assistant child of that user message** (`createdAt` as the tiebreak). Verified against React's displayed id on 72 rows across 5 chats (35 hub rows), zero mismatches, including an original-plus-retry case. `inputMode` is never populated on read, so "the non-retry child" can't be used.
+- **Row DOM:**
+  - User text is `[data-testid="user-message"]`, assistant text `[data-testid="assistant-message"]` (`.font-claude-response` is gone; fixed on main in `e0f13ea`).
+  - Toolbars: `[role="toolbar"][data-cds="MessageActions"]` when rendered (always on the last reply, otherwise on hover), or a collapsed `[data-testid="message-actions"]`.
+- A row can be a **chain** of several messages (`isChain`); none seen yet, maybe tool-call related. Leaf-type operations should use the last message.
+- **Debug only:** React props, walking `__reactFiber$…` `.return` from the turn-key element to the props holding `item.chain`, give `chain.displayUuid`, `messageUuids`, `lastMessageUuid` and a transcript-shaped `lastMessage` (`selectedOption`, `nOptions`, `siblingUuids`). Useful for cross-checks; not for production (D5).
+
+## Loading every message (and Ctrl+F)
+
+- **How the list grows:** from the snapshot's window, bounded by `older_history_cursor` (29) and `baseline_floor_message_id` (30), and **only** through `ReadConversationHistory` pages. Older messages in an ordinary update are ignored.
+- **Approach (D6):** pass the real snapshot through, fetch `ReadConversation` (proto, response field 2 = the update), then enqueue a **synthetic second snapshot**: the original snapshot's fields (keeping `replace_all_state`) minus 29/30, plus the full tree's messages/display groups/content blocks (3/4/5).
+  - 1,403-message chat (2.4 MB, ~1 s fetch): all 258 current-path rows known ~1.5 s after load, no scroll jump, jump-to-top instant, zero history calls.
+  - The blocking alternative (merge into the real snapshot) also works but delays the snapshot by the fetch (672 ms for 772 KB).
+- **Re-apply on every later `replace_all_state`.** A patched tab fell back from "of 258" to "of 16" within minutes once a fresh snapshot arrived.
+- **Ctrl+F is claude.ai's own find bar** (input labelled "Find"). It searches every **loaded** message, mounted or not, and fails today only because older messages aren't loaded. Full load restores it for the current branch; QoL chat search covers other branches.
+- **Plumbing:** settings are ISOLATED-only and load at `document_idle`, after the first snapshot. Mirror the toggle into a page `localStorage` key (e.g. `claude_qol_full_load`) that MAIN reads synchronously at `document_start`.
+- While the toggle is on, the stream stays wrapped for the whole session, so the toggle is also the off switch for any jank.
+- The page caches the full tree in IndexedDB; clear it after tests.
+- Acceptance check: Ctrl+F finds a word from message 1 of a long chat, both right after load and minutes later.
+
+## Toolkit (common)
+
+All in common's versioned `net.js` + `bard-schema.js`. Nothing is built yet.
+
+- **`decodeBard(type, bytes, { keepUnknown: true })`.** Every decoded message object carries `$unknown`, the raw records the schema didn't recognise. It's a plain property, so it survives `postMessage`/`structuredClone`.
+- **`encodeBard(type, obj)`.** The mirror of `decodeBard`'s JSON shape, writing `$unknown` back. It also builds new messages from scratch.
+- **Rule of thumb, chosen by blast radius, not speed:**
+  - **Append** `encodeBard(partial)` onto the original bytes for pure additions (phantoms, blocks, `hidden_context`, `client_tools`, new attachments, hiding via `deleted_*_ids`) and for singular-field overrides (`parent_message_id: ""`, `model`).
+  - **Round trip** (decode, edit, encode) only to edit or remove *inside an element of a repeated field*: messages in an update (re-parenting the root, `siblings_viewable`), or removing request attachments.
+- **Field references by name** through the schema, so a field that disappears after a regeneration fails loudly.
+- **Frame helpers:**
+  - A frame writer next to `readConnectFrames`.
+  - A stream rewrite wrapper that passes untouched frames (heartbeats, deltas) through as the original bytes and decodes only message-bearing frames.
+  - Unary body helpers (gunzip, header fix-up).
+- **Cost:** decoding the full 1,403-message tree takes 12.9 ms. Patching fires on snapshots, history pages, message-bearing live updates and sends; never on heartbeats.
+- **Jank caveat:** any body rewrite re-pipes every chunk through our `ReadableStream`, and the old completion-stream jank was never bisected. Test on the affected machines.
+- **Proof (extend `check-decoder.mjs`):**
+  - **Round trip:** decode with unknowns kept, re-encode, and require protobuf-es equality, unknown fields included.
+  - **Drift:** decode with a deliberately trimmed schema and check that the missing fields survive.
+  - **Well-known types to watch:** Timestamp nanos, Duration, Struct/Value, FieldMask casing, NaN/Infinity floats.
+
+## Legacy accounts (for D3)
+
+- **How to recognise one:** RPC endpoints return 403 "This feature is not included in your current plan". Tabs say "New chat" (merged: "New session").
+- **Frontend:** the same shell ("Message N of M" rows, `message-actions`, `chat-input-send`, the IndexedDB cache), but it loads through the legacy tree GET and `/completion`.
+  - Rows come from a different component with **no `data-turn-key` and no ids** in the DOM.
+- Calling `/completion` directly still works on merged chats, but ignores the merged chat's model (it replied with Opus 5.5 on a Haiku chat). Irrelevant under D1, but useful to know.
+
+## Feature map (starting point for the drill-down)
+
+| Feature | Merged approach | Notes |
+| --- | --- | --- |
+| Phantom messages | Splice into snapshot and history pages; rewrite phantom `parent_message_id` to `""` on root edits | Retry and non-root edits need nothing. |
+| Forking, summaryless | Native fork | No phantoms needed at all. |
+| Forking, summary / compaction | New chat plus our own send | `hidden_context` is a candidate for carrying history invisibly. |
+| Advanced edit (files) | Rewrite the edit's `send_message`: add or remove `attachments` / `inline_attachments` | Removal is a round trip. |
+| Navigation / bookmarks / chat search jumps | Full load + `data-turn-key` identity + `set_current_leaf` (true leaf) | |
+| Branch arrows | Splice `siblings_viewable` on snapshots, history pages and live updates | Plus the D7 banner. |
+| Image gallery | Splice blocks into stream and history pages (live and on load) | |
+| TTS auto-speak | Watch `StreamTimeline` for the settle (status leaves busy for idle) | The tracker's `request-hook.js` already does this. |
+| TTS "Read aloud" hijack | Unchanged (WebSocket) | Retest. |
+| Export / chat search data | `ReadConversation` (full tree, JSON or proto) | Text attachments come back as file URLs only; fetch the content. |
+| Project file download | Project data is still legacy REST; buttons must move into the "Context" dialog (table behind "Show context") | |
+| Model extras | `model` override on `send_message`; check the bootstrap/model-selector patching separately | |
+| Browser-side tools (new) | `client_tools` + `submit_client_tool_result` | New capability; nothing uses it yet. |
+
+## UI survey (main @ `e0f13ea`)
+
+- **Chat:** all header buttons and user-message buttons work. Fork and bookmark were fixed in `e0f13ea`.
+- **Home (`/new`):** fine (`#dframe-header-actions-slot`).
+- **Project page:** buttons now anchor in the header (fixed in `e0f13ea`). Files moved into the Context dialog; QoL's download buttons are not there yet.
+- **Projects list:** no QoL UI (probably none intended).
+- **Not surveyed:** Code/Cowork pages, the artifacts page, mobile layout, Electron, sidebar features, and whether each modal still opens and works.
+
+## Still open
+
+- Firefox (MAIN-world ordering) and Electron, for every interceptor.
+- Cross-chat attachment ids; the untested `send_message` fields listed above.
+- What a multi-message row chain (`isChain`) is.
+- Whether a workspace's files really don't roll back on a branch switch (create a file on branch A, switch to B, list `/mnt/user-data`).
+- The stream wrapper's jank behaviour on the affected machines.
+
+## Test artefacts
+
+- **Chats on the test account** (all deletable):
+  - "Splice test chat" `d22a3a67…`
+  - UI fork of 4c18a389: `8d5de03a…`
+  - Hand forks: `12274be5…`, `7e601b34…`
+- **After any experiment** that rewrites the stream, delete that conversation's entries from IndexedDB `claude-conversation-store` (`trees` and `meta`).
