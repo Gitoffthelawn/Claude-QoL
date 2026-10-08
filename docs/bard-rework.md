@@ -42,7 +42,8 @@ Hook `window.fetch` in MAIN, wrap the `StreamTimeline` body (frame by frame) and
 - **New content blocks** render, markdown included. A block reusing an existing id **replaces** it.
 - **Phantom messages:** fake `Message` + `DisplayGroup` (`GROUP_STYLE_INLINE`) + `ContentBlock` render as real rows ("Message 1 of N"), each with its own toolbar.
   - **Negative indices** (`-2`, `-1`) work, so real messages keep their indices. Only the real root needs re-parenting (`parent_message_id` = the last phantom).
-  - They survive reconnects (the stream closes every ~5 s and reopens), live turns (send, stream, settle) and post-turn updates.
+  - They survive live turns (send, stream, settle) and post-turn updates.
+- **Re-patch every snapshot.** The stream closes every ~5 s and reopens, and a reopened stream can start with a fresh `replace_all_state` snapshot that wipes anything not in it. An `inject()`ed block vanished at the 5 s reconnect (2026-10-09). Every patch (phantoms, arrows, full load, gallery) has to apply to *every* snapshot, not just the first; the phantom experiments did that, which is why they seemed to survive reconnects.
 - **Long chats:** the snapshot only holds the latest window (e.g. 30–122 messages). The root arrives in a `ReadConversationHistory` page (`ReadConversationHistoryResponse.update`), and the same splice works there.
 - **Client cache:** IndexedDB `claude-conversation-store` (`trees` + `meta`, keyed by conversation uuid) holds a legacy-shaped transcript (`hub_transcript` v2: `sender`, `parent_message_uuid`, typed content, `nOptions`, `siblingUuids`).
   - It paints first on a cold load, and the stream replaces it ~100 ms later.
