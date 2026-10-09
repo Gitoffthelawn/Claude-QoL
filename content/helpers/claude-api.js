@@ -5,15 +5,15 @@ const apiLog = createLogger('API');
 const MAX_FILES_PER_MESSAGE = 18;
 
 // ======== DB accessors (auto-detect isolated vs MAIN world) ========
-// ISOLATED uses databases.js directly; MAIN asks it over ClaudeExtBridge (served in databases.js).
-// A failed or unanswered call resolves null: callers treat that as "nothing stored".
-// The 5s timeout bounds the wait when the call is lost, see the serve() comment in databases.js.
+// ISOLATED uses databases.js directly; MAIN asks it over ClaudeExtBridge (served by db-serve.js).
+// A failed or unanswered call resolves undefined, while a handler's own "nothing stored" is null:
+// most callers treat both as nothing, but whoever would overwrite stored data must tell them apart.
 async function _dbCall(type, data) {
 	try {
 		return await ClaudeExtBridge.call('qol', type, data, { timeout: 5000 });
 	} catch (e) {
 		apiLog.warn(`${type} failed:`, e.message);
-		return null;
+		return undefined;
 	}
 }
 
@@ -38,14 +38,45 @@ async function storePhantomMessages(conversationId, messages) {
 	await _dbCall('PHANTOM_STORE', { conversationId, messages });
 }
 
+// Phantom messages as history JSON (ClaudeMessage.toHistoryJSON); null when none are stored, and
+// (MAIN only) undefined when the database couldn't be asked.
 async function getPhantomMessages(conversationId) {
+	// Very old forks kept them in the page's localStorage: move them to IndexedDB on first read.
+	for (const key of [`phantom_messages_${conversationId}`, `fork_history_${conversationId}`]) {
+		const legacy = localStorage.getItem(key);
+		if (!legacy) continue;
+		const messages = JSON.parse(legacy);
+		await storePhantomMessages(conversationId, messages);
+		localStorage.removeItem(`phantom_messages_${conversationId}`);
+		localStorage.removeItem(`fork_history_${conversationId}`);
+		return messages;
+	}
+
 	const get = window.ClaudeSearchShared?.getPhantomMessages;
 	if (get) return await get(conversationId);
 
-	return await _dbCall('PHANTOM_GET', { conversationId }) || null;
+	return await _dbCall('PHANTOM_GET', { conversationId });
 }
 
 const ROOT_MESSAGE_UUID = "00000000-0000-4000-8000-000000000000";
+
+// On the page, phantom messages carry ids of their own (phantom-messages.js): UUID-shaped, derived from
+// the stored message's uuid (stable across snapshots), with a marker first group no real id has.
+// Phantoms keep their source chat's uuids, so without this they'd collide with that chat's real
+// messages. The page never sends them anywhere (a send from a phantom is rewritten).
+const PHANTOM_ID_PREFIX = 'fffffffe-';
+const phantomMessageId = (uuid) => PHANTOM_ID_PREFIX + uuid.slice(PHANTOM_ID_PREFIX.length);
+// Also true for a phantom row's "<id>-hub-reply" turn key.
+const isPhantomId = (id) => typeof id === 'string' && id.startsWith(PHANTOM_ID_PREFIX);
+
+// The phantoms as the page shows them: page ids, chained in order from the root.
+function pagePhantoms(phantomJson) {
+	return phantomJson.map((msg, i) => ({
+		...msg,
+		uuid: phantomMessageId(msg.uuid),
+		parent_message_uuid: i ? phantomMessageId(phantomJson[i - 1].uuid) : ROOT_MESSAGE_UUID,
+	}));
+}
 
 // Splice phantom (forked-in) messages onto the front of conversation data, the way the
 // page sees them. Rewiring the real root messages to hang off the last phantom is what
@@ -552,8 +583,8 @@ class ClaudeConversation {
 		}
 		if (!phantoms?.length) return this._trunkFrom(data);
 
-		// MAIN world hands back hydrated ClaudeMessages, ISOLATED raw history JSON.
-		const phantomJson = phantoms.map(msg => msg.toHistoryJSON ? msg.toHistoryJSON() : msg);
+		// With the ids the page shows them under, so rows and positions line up.
+		const phantomJson = pagePhantoms(phantoms.map(msg => msg.toHistoryJSON ? msg.toHistoryJSON() : msg));
 
 		// Non-mutating: `data` is cached on this instance and in IndexedDB, and must stay
 		// phantom-free so getMessages() keeps returning the real branch.
