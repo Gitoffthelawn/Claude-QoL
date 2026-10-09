@@ -10,7 +10,7 @@ how.
 
 | # | Decision |
 | --- | --- |
-| D1 | **The rework is merged-only.** No legacy code paths in the new code. Reads move to `ReadConversation` too. |
+| D1 | **The rework is merged-only.** No legacy code paths in the new code. **Revised 2026-10-09: reads stay on the legacy tree GET** (`ClaudeConversation.getData`), like the tracker. It still answers for merged chats with full fidelity (text attachments' `extracted_content`, raw `tool_use.input`, pre-merge `compaction_summary`), which `ReadConversation` lacks. A `ReadConversation` adapter is the documented contingency if the GET ever starts failing (gaps: README "Legacy JSON still answers" and the comparison table). Interception and our own actions use the new API. |
 | D2 | **Process:** a long-lived rework branch, with PRs into that branch, merged to `main` when ready, timed to the rollout. The current release keeps serving legacy accounts until then. |
 | D3 | The reworked version **detects legacy accounts** (RPC 403, or no `StreamTimeline`) and shows a notice instead of half-working features. |
 | D4 | **Protobuf toolkit in common** (`net.js` + `bard-schema.js`, versioned): decode with unknown fields kept, then edit, then encode. Fields are referenced **by name**, never by number. See [Toolkit](#toolkit-common). |
@@ -218,7 +218,7 @@ Every "splice" / "rewrite" / "watch the stream" below means a patch registered w
 | Image gallery | Splice blocks into stream and history pages (live and on load) | |
 | TTS auto-speak | Watch `StreamTimeline` for the settle (status leaves busy for idle) | The tracker's `request-hook.js` already does this. |
 | TTS "Read aloud" hijack | Unchanged (WebSocket) | Retest. |
-| Export / chat search data | `ReadConversation` (full tree, JSON or proto) | Text attachments come back as file URLs only; fetch the content. |
+| Export / chat search data | Legacy tree GET, unchanged (D1 revised) | Contingency if it fails: `ReadConversation` (full tree, JSON or proto) through an adapter. Text attachments are file URLs there (fetch the content), and tool input is summarised. |
 | Project file download | Project data is still legacy REST; buttons must move into the "Context" dialog (table behind "Show context") | |
 | Model extras | `model` override on `send_message`; check the bootstrap/model-selector patching separately | |
 | Browser-side tools (new) | `client_tools` + `submit_client_tool_result` | New capability; nothing uses it yet. |
