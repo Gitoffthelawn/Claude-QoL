@@ -95,8 +95,15 @@ with the header `conversation_id` = **a new uuid we choose**.
   - `PerformAction` `set_current_leaf (23)` works. A message with children gets `invalid_leaf_target` (on the stream only).
   - **The open page follows live:** the banner goes, Send enables, and the view stays. The next send continues that branch, with the client setting `parent_message_id` itself.
   - The legacy `PUT …/current_leaf_message_uuid` also sets the merged leaf (a message with children gets 400 "Current leaf message has unexpected children"). Not to be used, per D1.
-- **Planned UX (D7):** when the earlier-version banner appears, add our own banner, "QoL: Continue anyway?", with "(Files will not be rolled back)" only when the chat has `workspace_upgraded`. On click, `set_current_leaf` to the viewed branch's leaf: take the switched message's id (see [identity](#message-identity-in-the-dom)) and walk down the tree to its newest descendant.
-- **Why it's hidden (likely):** workspace chats have a linear sandbox filesystem (`/mnt/user-data`) that wouldn't roll back with the branch. The server still allows branching anywhere (edits and retries rely on it).
+- **Upgraded (workspace) chats can't switch in place at all.** Server-gated, tested 2026-10-09 on chat `0a8b7ec1…`:
+  - `set_current_leaf` to a true leaf is accepted and acked with no error, but the leaf doesn't move. The legacy PUT returns 200 echoing the id, and the leaf doesn't move either.
+  - A send whose parent isn't the current leaf is rejected on the stream with `ccrproxy_branch_send_unsupported`, "Editing and retrying aren't available here yet". No message is created.
+    - Exception: `parent_message_id: ""` (a new root) was accepted after the upgrade.
+  - **The sandbox (`/mnt/user-data`) is shared across branches:** a sibling branch listed the other branch's file. Nothing rolls back.
+- **Planned UX (D7):** when the earlier-version banner appears, add our own banner.
+  - **Non-upgraded chats:** "QoL: Continue anyway?". On click, `set_current_leaf` to the viewed branch's leaf: take the switched message's id (see [identity](#message-identity-in-the-dom)) and walk down the tree to its newest descendant.
+  - **Upgraded chats** (`workspace_upgraded`): in-place continuation is impossible, so the banner explains why and points to the native fork ("Continue in a new session").
+- **Why it's hidden:** the shared, non-rolling-back sandbox above. Non-upgraded chats still allow branching anywhere (edits and retries rely on it).
 
 ## Message identity in the DOM
 
@@ -148,6 +155,47 @@ Precedence rules:
   - **Drift:** decode with a deliberately trimmed schema and check that the missing fields survive.
   - **Well-known types to watch:** Timestamp nanos, Duration, Struct/Value, FieldMask casing, NaN/Infinity floats.
 
+## Interceptor host (`content/main/bard-host.js`)
+
+The one place QoL intercepts the RPCs. **Features never wrap them themselves**; they register patches with `QolBardHost`:
+
+| Registration | Runs on |
+| --- | --- |
+| `onSnapshot(fn)` | every `StreamTimeline` update with `replace_all_state`: the first one, reconnect snapshots, and snapshots injected through `ctx.inject` |
+| `onLiveUpdate(fn)` | other `StreamTimeline` updates carrying messages / display groups / content blocks |
+| `onHistoryPage(fn)` | `ReadConversationHistoryResponse.update` |
+| `onSend(fn)` | `PerformAction`'s `send_message`, before it leaves |
+| `observe(fn)` | read-only, every non-heartbeat `StreamTimeline` event as the server sent it |
+
+- **A patch** is `fn(target, ctx)`. It may be async, edits `target` in place (decoded with `keepUnknown`), and returns `true` if it changed something. The host re-encodes only then; otherwise the original bytes pass through.
+- **`ctx`:** `{ source, orgId, conversationId, inject }`.
+- **`ctx.inject(event)`** (streams) runs injected snapshots through the `onSnapshot` patches first, which is the composition guarantee full load needs. It returns `false` once that connection has ended (the server reconnects on a cadence), so inject from the current connection's `ctx`.
+- **Registration order is execution order.** An optional `{ label }` names a patch in logs.
+- **Fail-open:**
+  - a throwing patch is logged and skipped;
+  - an undecodable frame or body passes through as it came;
+  - a method with nothing registered isn't wrapped at all.
+- **Escape hatches:**
+  - `QolBardHost.rawFetch` (MAIN-world calls that must see server data; ISOLATED fetches are never patched);
+  - kill switch `localStorage.claude_qol_bard_host_off = '1'`.
+- **Manifest position:** first in the MAIN group after `extra-models.js`, preceded only by `net.js` and `bard-schema.js` (Firefox ordering). The logger and `page.js` are looked up lazily.
+- **Account mode:** `QolBardHost.accountMode()` in MAIN, or `qolAccountMode()` (toolbox-ui.js) in either world, gives `'merged' | 'legacy' | 'unknown'` for the active org, from page `localStorage.claude_qol_account_mode`.
+  - **`merged`:** any successful RPC response sets it.
+  - **`legacy`:** only an hourly `GetNewConversationDefaults` probe returning 403 `permission_denied` sets it.
+  - With `legacy`, `notifications.js` shows a once-per-session card.
+- **Verified live (2026-10-09):**
+  - patches survive reconnect snapshots;
+  - an injected clean snapshot went through `onSnapshot`;
+  - `onSend` `hidden_context` reached the model;
+  - `onHistoryPage` fired on every page;
+  - a throwing patch was harmless;
+  - the kill switch disables wrapping;
+  - the legacy card shows.
+- **Firefox (Android Nightly, verified 2026-10-09):**
+  - `QolBardHost.diagnostics` (`{ loadedAt, firstSeen: { [method]: ms } }`, performance clock) showed the host in place ~300 ms before the page's first `StreamTimeline` on every one of 5 loads (e.g. 851 → 1154 ms);
+  - an `onSnapshot` patch rendered.
+  - Check `diagnostics` again if Firefox ever seems to miss the first snapshot.
+
 ## Legacy accounts (for D3)
 
 - **How to recognise one:** RPC endpoints return 403 "This feature is not included in your current plan". Tabs say "New chat" (merged: "New session").
@@ -156,6 +204,8 @@ Precedence rules:
 - Calling `/completion` directly still works on merged chats, but ignores the merged chat's model (it replied with Opus 5.5 on a Haiku chat). Irrelevant under D1, but useful to know.
 
 ## Feature map (starting point for the drill-down)
+
+Every "splice" / "rewrite" / "watch the stream" below means a patch registered with the [interceptor host](#interceptor-host-contentmainbard-hostjs): `onSnapshot` / `onHistoryPage` / `onLiveUpdate` / `onSend` / `observe`.
 
 | Feature | Merged approach | Notes |
 | --- | --- | --- |
@@ -186,7 +236,6 @@ Precedence rules:
 - Firefox (MAIN-world ordering) and Electron, for every interceptor.
 - Cross-chat attachment ids; the untested `send_message` fields listed above.
 - What a multi-message row chain (`isChain`) is.
-- Whether a workspace's files really don't roll back on a branch switch (create a file on branch A, switch to B, list `/mnt/user-data`).
 - The stream wrapper's jank behaviour on the affected machines.
 
 ## Test artefacts
@@ -195,4 +244,5 @@ Precedence rules:
   - "Splice test chat" `d22a3a67…`
   - UI fork of 4c18a389: `8d5de03a…`
   - Hand forks: `12274be5…`, `7e601b34…`
+  - Upgraded-chat branch test: `0a8b7ec1…` (has a sandbox with `a.txt` / `b.txt`)
 - **After any experiment** that rewrites the stream, delete that conversation's entries from IndexedDB `claude-conversation-store` (`trees` and `meta`).
