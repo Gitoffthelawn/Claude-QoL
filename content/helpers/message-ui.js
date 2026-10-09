@@ -197,13 +197,17 @@ async function revealMessageByUuid(uuid, { highlight = true, conversation = null
 	try {
 		if (!await _waitForMessageList()) return null;
 
+		// After a load the list pins its tail until the user scrolls: any scroll of ours snaps back to
+		// the bottom on the next frame. A (synthetic, so inert) wheel event counts as the user scrolling.
+		getMessageScroller()?.dispatchEvent(new WheelEvent('wheel', { deltaY: -1, bubbles: true, cancelable: true }));
+
 		const conv = conversation ?? new ClaudeConversation(getOrgId(), getConversationId());
 		const tree = (await conv.getData()).chat_messages ?? [];
 		const findTarget = () => rowForUuid(uuid, tree);
 
 		// Already on screen — nothing to hunt for.
 		const alreadyThere = findTarget();
-		if (alreadyThere) return _settleOnMessage(alreadyThere, highlight);
+		if (alreadyThere) return await _settleOnMessage(findTarget, highlight);
 
 		const messages = await conv.getRenderedMessages();
 		const positions = new Map(messages.map((msg, i) => [msg.uuid, i]));
@@ -224,15 +228,27 @@ async function revealMessageByUuid(uuid, { highlight = true, conversation = null
 			await _bracketTowardAnchor(scroller, findTarget, positionOf, targetPosition, maxProbes);
 		}
 
-		const target = findTarget();
-		if (!target) return null;
-		return _settleOnMessage(target, highlight);
+		if (!findTarget()) return null;
+		return await _settleOnMessage(findTarget, highlight);
 	} catch (error) {
 		messageUiLog.error('revealMessageByUuid failed:', error);
 		return null;
 	} finally {
 		_revealInFlight = false;
 	}
+}
+
+// "Go to" for any message in the tree (bookmarks, chat search, latest/longest): moves the current leaf
+// there (`leafId`, or the longest leaf below the target) and reloads; chat-search.js's
+// scrollToMessageByUuid reveals the target after the load. Always a reload, even for a target that
+// looks on-branch: the branch arrows switch versions client-side, so the server's branch isn't
+// necessarily the one on screen.
+// Upgraded (workspace) chats can't move their leaf: jumps to another branch there are still to be
+// implemented (docs/bard-rework.md, "Still open").
+async function jumpToMessage(conversation, uuid, leafId = null) {
+	await conversation.getData();
+	sessionStorage.setItem('message_uuid_to_find', uuid);
+	await conversation.setCurrentLeaf(leafId ?? conversation.findLongestLeaf(uuid).leafId); // reloads
 }
 
 // Rows can lag a freshly mounted window by a frame or two.
@@ -309,16 +325,40 @@ async function _bracketTowardAnchor(scroller, findAnchor, positionOf, targetPosi
 }
 
 // Centre the message and flash it.
-function _settleOnMessage(target, highlight) {
+// Scrolls the row findTarget() returns into view and returns it, or null if it can't be kept there.
+async function _settleOnMessage(findTarget, highlight) {
 	// Instant, not smooth: smooth-scrolling across a virtualized list unmounts
 	// rows mid-flight and the scroll lands nowhere.
 	//
 	// Centre short messages, but align tall ones to the top — messages are
 	// routinely twice the viewport height, and centring those drops you into the
 	// middle of the text instead of at its start.
+	//
+	// Rows that just mounted still get measured, and the virtualizer corrects
+	// scrollTop for that over the next frames, which can undo our scroll (or
+	// unmount the row): look the row up again after a couple of frames, and
+	// settle again if it drifted off screen or was replaced.
 	const scroller = getMessageScroller();
-	const fitsOnScreen = !scroller || target.getBoundingClientRect().height <= scroller.clientHeight;
-	target.scrollIntoView({ block: fitsOnScreen ? 'center' : 'start' });
+	const nextFrames = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+	// Visible inside the message list, not just the window (the header and composer overlap it).
+	const isVisible = (el) => {
+		const rect = el.getBoundingClientRect();
+		const view = scroller?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight };
+		return rect.bottom > view.top && rect.top < view.bottom;
+	};
+	let target = null;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		target = findTarget();
+		if (target) {
+			const fitsOnScreen = !scroller || target.getBoundingClientRect().height <= scroller.clientHeight;
+			target.scrollIntoView({ block: fitsOnScreen ? 'center' : 'start' });
+		}
+		await nextFrames();
+		target = findTarget();
+		if (target && isVisible(target)) break;
+		target = null;
+	}
+	if (!target) return null;
 
 	if (highlight) {
 		target.style.transition = 'background-color 0.3s';
