@@ -35,6 +35,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ja'] ??= {}, {
 	"nav.message_uuid_not_found": "メッセージのUUIDが見つかりませんでした",
 	"nav.success_title": "完了",
 	"nav.bookmark_added": "ブックマークを追加しました！",
+	"nav.continue_anyway_text": "QoL: このバージョンをここで続けることもできます。",
+	"nav.continue_anyway_button": "ここから続ける",
+	"nav.continuing": "このバージョンに切り替えています...",
+	"nav.continue_upgraded_text": "QoL: このチャットではファイルがすべてのバージョンで共有されているため、以前のバージョンをこの場で続けることはできません。代わりにフォークできます。",
+	"nav.jump_view_text": "QoL: このチャットの以前のバージョンを表示しています。ここでは送信が一時停止されています。",
+	"nav.back_to_latest": "最新に戻る",
 
 	// search
 	"search.branched_messages_ago": "{n}件前のメッセージで分岐",
@@ -195,7 +201,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ja'] ??= {}, {
 	"tts.model_label": "モデル",
 	"tts.custom_model_hint": "カスタムエンドポイントのモデル名",
 	"tts.auto_speak": "新しいメッセージを自動で読み上げ",
-	"tts.auto_speak_note": "通常のチャットでのみ動作します（CoworkやCodeでは動作しません）",
+	"tts.auto_speak_note": "通常のチャットでのみ動作します（Codeでは動作しません）",
 	"tts.per_chat_heading": "チャットごとの設定",
 	"tts.quotes_only": "引用符内のテキストのみ読み上げ",
 	"tts.quotes_only_tooltip": "正規表現でセリフのみをすばやく再生（即時、API呼び出しなし）",
@@ -282,6 +288,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ja'] ??= {}, {
 	"fork.creating": "フォークした会話を作成中…",
 	"fork.complete_redirecting": "フォークが完了しました！移動中…",
 	"fork.fork_failed": "会話をフォークできませんでした：{error}",
+	"fork.upgraded_warning": "このチャットはクラウド環境で動作しています。フォークしたチャットには、そこで作成されたファイルは含まれません！",
 	"fork.files_not_transferred": "以下のファイルはフォークした会話に引き継げませんでした：",
 	"fork.file_transfer_warning": "ファイル転送の警告",
 	"fork.upload_failed_title": "ファイルのアップロードに失敗しました",
@@ -326,8 +333,6 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ja'] ??= {}, {
 	// images
 	"images.generated_image": "生成された画像",
 	"images.generated_images": "生成された画像",
-	"images.generated_for": "生成された画像：{prompt}",
-	"images.generated_title": "生成：{prompt}",
 
 	// models
 	"models.opus_notice": "Opusは他のモデルよりも早く使用制限に達します",
@@ -355,4 +360,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ja'] ??= {}, {
 
 	// main
 	"main.rich_copy_no_text": "テキストコンテンツが見つかりません",
+
+	// account
+	"account.legacy_title": "お使いのアカウントはまだ新しい claude.ai に移行していません",
+	"account.legacy_body": "このバージョンの Claude QoL には claude.ai の新しいエクスペリエンスが必要ですが、まだお使いのアカウントでは利用できません。それまでチャット機能は動作しません。",
+
+	// settings
+	"settings.full_load": "会話全体を読み込む",
+	"settings.full_load_hint": "チャットを開いたときにすべてのメッセージを読み込み、Ctrl+F、チャット検索、ブックマークが古いメッセージにも届くようにします。長いチャットが重く感じる場合はオフにしてください。",
 });

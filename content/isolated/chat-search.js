@@ -122,7 +122,7 @@
 	}
 
 	// ======== CONTEXT MODAL ========
-	function showContextModal(result, query, conversation) {
+	function showContextModal(result, query, goTo) {
 		const contentDiv = document.createElement('div');
 
 		// Scrollable messages container
@@ -207,19 +207,8 @@
 		const modal = new ClaudeModal(localize('search.message_context'), contentDiv);
 
 		modal.addCancel();
-		modal.addConfirm(localize('search.go_to_message'), async () => {
-			// Show loading modal
-			const loadingModal = createLoadingModal(localize('search.navigating_to_message'));
-			loadingModal.show();
-
-			// Human messages carry no data-message-uuid in the DOM, but
-			// revealMessageByUuid resolves them via the adjacent assistant message.
-			sessionStorage.setItem('message_uuid_to_find', result.matched_message_id);
-
-			const longestLeaf = conversation.findLongestLeaf(result.matched_message_id);
-			await conversation.setCurrentLeaf(longestLeaf.leafId);
-			window.location.reload();
-		});
+		// Any message, human or assistant: rows are found by data-turn-key.
+		modal.addConfirm(localize('search.go_to_message'), () => goTo(localize('search.navigating_to_message'), result.matched_message_id));
 
 		// Make context modal larger
 		modal.modal.classList.remove('max-w-md');
@@ -265,41 +254,9 @@
 		// Build the search UI
 		const contentDiv = document.createElement('div');
 
-		// Go to Latest / Go to Longest buttons row
-		const topButtonsRow = document.createElement('div');
-		topButtonsRow.className = CLAUDE_CLASSES.FLEX_GAP_2 + ' mb-4';
+		const goTo = (loadingText, uuid) => jumpToMessage(conversation, uuid, loadingText);
 
-		const latestBtn = createClaudeButton(localize('common.go_to_latest'), 'secondary', async () => {
-			let latestMessage = null;
-			let latestTimestamp = 0;
-
-			const messages = await conversation.getMessages(true);
-			for (const msg of messages) {
-				const timestamp = new Date(msg.created_at).getTime();
-				if (timestamp > latestTimestamp) {
-					latestTimestamp = timestamp;
-					latestMessage = msg;
-				}
-			}
-
-			if (latestMessage) {
-				await conversation.setCurrentLeaf(latestMessage.uuid);
-				window.location.reload();
-			}
-		});
-
-		const longestBtn = createClaudeButton(localize('common.go_to_longest'), 'secondary', async () => {
-			const rootId = "00000000-0000-4000-8000-000000000000";
-			const longestLeaf = conversation.findLongestLeaf(rootId);
-			await conversation.setCurrentLeaf(longestLeaf.leafId);
-			window.location.reload();
-		});
-		longestBtn.classList.add('w-full');
-		latestBtn.classList.add('w-full');
-
-		topButtonsRow.appendChild(latestBtn);
-		topButtonsRow.appendChild(longestBtn);
-		contentDiv.appendChild(topButtonsRow);
+		contentDiv.appendChild(createLatestLongestRow(conversation));
 
 		// Search input row
 		const searchRow = document.createElement('div');
@@ -370,7 +327,7 @@
 				resultItem.appendChild(matchText);
 
 				resultItem.onclick = () => {
-					showContextModal(result, query, conversation);
+					showContextModal(result, query, goTo);
 				};
 
 				resultsContainer.appendChild(resultItem);
@@ -419,6 +376,11 @@
 		if (!messageUuid) return;
 		sessionStorage.removeItem('message_uuid_to_find');
 		sessionStorage.removeItem('highlight_previous_message'); // legacy key, no longer written
+
+		// A jump to another branch: wait until jump-view.js has applied (or dropped) it, or positions
+		// would come from the server's branch. claude.ai can draw its cached copy of the chat before the
+		// (possibly held) snapshot lands, so "the list is there" isn't enough.
+		await qolJumpSettled();
 
 		const revealed = await revealMessageByUuid(messageUuid);
 		if (!revealed) log('Could not reveal message', messageUuid);

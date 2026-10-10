@@ -35,6 +35,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['en'] ??= {}, {
 	"nav.message_uuid_not_found": "Could not find message UUID",
 	"nav.success_title": "Success",
 	"nav.bookmark_added": "Bookmark added!",
+	"nav.continue_anyway_text": "QoL: you can continue this version here instead.",
+	"nav.continue_anyway_button": "Continue from here",
+	"nav.continuing": "Switching to this version...",
+	"nav.continue_upgraded_text": "QoL: this chat can't continue an earlier version in place, because its files are shared across versions. You can fork it instead.",
+	"nav.jump_view_text": "QoL: you're viewing an earlier version of this chat. Sending is paused here.",
+	"nav.back_to_latest": "Back to latest",
 
 	// search
 	"search.branched_messages_ago": "Branched {n} messages ago",
@@ -195,7 +201,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['en'] ??= {}, {
 	"tts.model_label": "Model",
 	"tts.custom_model_hint": "Model name for the custom endpoint",
 	"tts.auto_speak": "Auto-speak on new message",
-	"tts.auto_speak_note": "Only works on normal chats (not cowork, not code)",
+	"tts.auto_speak_note": "Only works on normal chats (not code)",
 	"tts.per_chat_heading": "Per-Chat Settings",
 	"tts.quotes_only": "Only speak quoted text",
 	"tts.quotes_only_tooltip": "Quick dialogue-only playback using regex (instant, no API call)",
@@ -282,6 +288,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['en'] ??= {}, {
 	"fork.creating": "Creating forked conversation...",
 	"fork.complete_redirecting": "Fork complete! Redirecting...",
 	"fork.fork_failed": "Failed to fork conversation: {error}",
+	"fork.upgraded_warning": "This chat runs in a cloud environment: the forked chat will not include any files created there!",
 	"fork.files_not_transferred": "The following files could not be transferred to the forked conversation:",
 	"fork.file_transfer_warning": "File Transfer Warning",
 	"fork.upload_failed_title": "File Upload Failed",
@@ -326,8 +333,6 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['en'] ??= {}, {
 	// images
 	"images.generated_image": "Generated image",
 	"images.generated_images": "Generated images",
-	"images.generated_for": "Generated image for: {prompt}",
-	"images.generated_title": "Generated: {prompt}",
 
 	// models
 	"models.opus_notice": "Opus consumes usage limits faster than other models",
@@ -355,4 +360,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['en'] ??= {}, {
 
 	// main
 	"main.rich_copy_no_text": "No text content found",
+
+	// account
+	"account.legacy_title": "Your account isn't on the new claude.ai yet",
+	"account.legacy_body": "This version of Claude QoL needs claude.ai's new experience, which hasn't reached your account. Its chat features won't work until it does.",
+
+	// settings
+	"settings.full_load": "Load whole conversations",
+	"settings.full_load_hint": "Loads every message when a chat opens, so Ctrl+F, chat search and bookmarks can reach old messages. Turn it off if long chats feel slow.",
 });

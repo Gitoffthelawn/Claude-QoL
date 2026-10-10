@@ -5,15 +5,15 @@ const apiLog = createLogger('API');
 const MAX_FILES_PER_MESSAGE = 18;
 
 // ======== DB accessors (auto-detect isolated vs MAIN world) ========
-// ISOLATED uses databases.js directly; MAIN asks it over ClaudeExtBridge (served in databases.js).
-// A failed or unanswered call resolves null: callers treat that as "nothing stored".
-// The 5s timeout bounds the wait when the call is lost, see the serve() comment in databases.js.
+// ISOLATED uses databases.js directly; MAIN asks it over ClaudeExtBridge (served by db-serve.js).
+// A failed or unanswered call resolves undefined, while a handler's own "nothing stored" is null:
+// most callers treat both as nothing, but whoever would overwrite stored data must tell them apart.
 async function _dbCall(type, data) {
 	try {
 		return await ClaudeExtBridge.call('qol', type, data, { timeout: 5000 });
 	} catch (e) {
 		apiLog.warn(`${type} failed:`, e.message);
-		return null;
+		return undefined;
 	}
 }
 
@@ -38,45 +38,68 @@ async function storePhantomMessages(conversationId, messages) {
 	await _dbCall('PHANTOM_STORE', { conversationId, messages });
 }
 
+// Phantom messages as history JSON (ClaudeMessage.toHistoryJSON); null when none are stored, and
+// (MAIN only) undefined when the database couldn't be asked.
 async function getPhantomMessages(conversationId) {
+	// Very old forks kept them in the page's localStorage: move them to IndexedDB on first read.
+	for (const key of legacyPhantomKeys(conversationId)) {
+		const legacy = localStorage.getItem(key);
+		if (!legacy) continue;
+		const messages = JSON.parse(legacy);
+		await storePhantomMessages(conversationId, messages);
+		legacyPhantomKeys(conversationId).forEach(k => localStorage.removeItem(k));
+		return messages;
+	}
+
 	const get = window.ClaudeSearchShared?.getPhantomMessages;
 	if (get) return await get(conversationId);
 
-	return await _dbCall('PHANTOM_GET', { conversationId }) || null;
+	return await _dbCall('PHANTOM_GET', { conversationId });
 }
 
 const ROOT_MESSAGE_UUID = "00000000-0000-4000-8000-000000000000";
 
-// Splice phantom (forked-in) messages onto the front of conversation data, the way the
-// page sees them. Rewiring the real root messages to hang off the last phantom is what
-// makes a parent-chain walk return the whole thing in order.
-//
-// `mutate: false` leaves the input untouched, which matters when the input is a cached
-// conversation payload — see ClaudeConversation.getRenderedMessages.
-function stitchPhantomMessages(data, phantomJson, { mutate = true } = {}) {
-	if (!phantomJson?.length) return data;
+// On the page, phantom messages carry ids of their own (phantom-messages.js): UUID-shaped, derived from
+// the stored message's uuid (stable across snapshots), with a marker first group no real id has.
+// Phantoms keep their source chat's uuids, so without this they'd collide with that chat's real
+// messages. The page never sends them anywhere (a send from a phantom is rewritten).
+const PHANTOM_ID_PREFIX = 'fffffffe-';
+const phantomMessageId = (uuid) => PHANTOM_ID_PREFIX + uuid.slice(PHANTOM_ID_PREFIX.length);
+// Also true for a phantom row's "<id>-hub-reply" turn key.
+const isPhantomId = (id) => typeof id === 'string' && id.startsWith(PHANTOM_ID_PREFIX);
 
-	const lastPhantom = phantomJson[phantomJson.length - 1];
-	const isRoot = msg => msg.parent_message_uuid === ROOT_MESSAGE_UUID;
+// Where phantoms live besides IndexedDB: the ids of conversations that have some, mirrored to the
+// page's localStorage by databases.js (phantom-messages.js reads it synchronously), and the keys very
+// old forks stored the phantoms themselves under.
+const PHANTOM_IDS_KEY = 'claude_qol_phantom_ids';
+const legacyPhantomKeys = (conversationId) => [`phantom_messages_${conversationId}`, `fork_history_${conversationId}`];
 
-	const realMessages = (data.chat_messages || []).map(msg => {
-		if (!isRoot(msg)) return msg;
-		const rewired = mutate ? msg : { ...msg };
-		rewired.parent_message_uuid = lastPhantom.uuid;
-		return rewired;
-	});
+const PHANTOM_ACK_TEXT = 'Acknowledged - end of previous conversation.';
 
-	const chat_messages = [...phantomJson, ...realMessages];
-
-	if (!mutate) {
-		// Array order is all the copy's callers need. `index` is only meaningful for the
-		// page-facing payload, and rewriting it here would touch shared message objects.
-		return { ...data, chat_messages };
+// The phantoms (history JSON) as the page shows them, in order from the root: page ids, each parented
+// to the one before (the first to ROOT_MESSAGE_UUID), and, when the chain ends on a user message, an
+// assistant acknowledgement after it (as the legacy version did, and the fork's handshake expects).
+function pagePhantoms(phantomJson) {
+	const chain = phantomJson.map(msg => ({ ...msg, uuid: phantomMessageId(msg.uuid) }));
+	const last = phantomJson.at(-1);
+	if (last?.sender === 'human') {
+		chain.push({
+			uuid: `${PHANTOM_ID_PREFIX}0000-4000-8000-${last.uuid.slice(-12)}`,
+			sender: 'assistant', text: PHANTOM_ACK_TEXT, content: [{ type: 'text', text: PHANTOM_ACK_TEXT }], created_at: last.created_at,
+		});
 	}
+	chain.forEach((msg, i) => { msg.parent_message_uuid = i ? chain[i - 1].uuid : ROOT_MESSAGE_UUID; });
+	return chain;
+}
 
-	data.chat_messages = chat_messages;
-	data.chat_messages.forEach((msg, idx) => { msg.index = idx; });
-	return data;
+// Conversation data with the phantoms spliced onto the front, the way the page sees them: the real
+// roots hang off the last phantom, so a parent-chain walk returns the whole thing in order. Leaves
+// data untouched (it may be a cached payload).
+function stitchPhantomMessages(data, phantomJson) {
+	if (!phantomJson?.length) return data;
+	const lastId = phantomJson.at(-1).uuid;
+	const realMessages = (data.chat_messages || []).map(msg => msg.parent_message_uuid === ROOT_MESSAGE_UUID ? { ...msg, parent_message_uuid: lastId } : msg);
+	return { ...data, chat_messages: [...phantomJson, ...realMessages] };
 }
 
 async function clearPhantomMessages(conversationId) {
@@ -106,6 +129,33 @@ async function bustReactQueryCache() {
 	});
 }
 bustReactQueryCache();
+
+// The jump view's state, which jump-view.js (MAIN) keeps on <html>. The jumped leaf while
+// conversationId is shown jumped, else null.
+function qolJumpedLeaf(conversationId) {
+	const root = document.documentElement;
+	return conversationId && root.getAttribute('data-qol-jump-view') === conversationId
+		? root.getAttribute('data-qol-jump-leaf')
+		: null;
+}
+
+// Resolves once a jump made by this page load has been applied or dropped (at once without one), or
+// after timeoutMs; it outlasts the host's snapshot wait budget (15 s), which can hold the jump that long.
+function qolJumpSettled(timeoutMs = 20000) {
+	const root = document.documentElement;
+	const pending = () => root.getAttribute('data-qol-jump-state') === 'pending';
+	if (!pending()) return Promise.resolve();
+	return new Promise((resolve) => {
+		const done = () => {
+			observer.disconnect();
+			clearTimeout(timer);
+			resolve();
+		};
+		const observer = new MutationObserver(() => { if (!pending()) done(); });
+		observer.observe(root, { attributes: true, attributeFilter: ['data-qol-jump-state'] });
+		const timer = setTimeout(done, timeoutMs);
+	});
+}
 
 // Shared streaming freshness check.
 // Fetches apiUrl, reads the conversation header (everything before "chat_messages") and
@@ -180,8 +230,8 @@ class ClaudeConversation {
 		this._pendingCreateParams = null;
 	}
 
-	// Prepare a new conversation locally. No server call — actual creation
-	// happens on the first sendMessageAndWaitForResponse via create_conversation_params.
+	// Prepare a new conversation locally. No server call: the first sendMessageAndWaitForResponse
+	// creates it (with this id, model and project), then names it.
 	prepareNew(name, model = null, projectUuid = null, accountFeatureSettings = null) {
 		if (this.conversationId) {
 			throw new Error('Conversation already exists');
@@ -190,11 +240,7 @@ class ClaudeConversation {
 		this.conversationId = this.generateUuid();
 		this.accountFeatureSettings = accountFeatureSettings;
 
-		this._pendingCreateParams = {
-			include_conversation_preferences: true,
-			is_temporary: false,
-			name: name || '',
-		};
+		this._pendingCreateParams = { name: name || '' };
 		if (model) this._pendingCreateParams.model = model;
 		if (projectUuid) this._pendingCreateParams.project_uuid = projectUuid;
 
@@ -209,76 +255,38 @@ class ClaudeConversation {
 		return this.conversationId;
 	}
 
+	// Send a message and wait for Claude's reply; returns the reply as a ClaudeMessage. A string is a
+	// plain prompt (options: model, parentMessageUuid); a ClaudeMessage brings its own files.
 	async sendMessageAndWaitForResponse(promptOrMessage, options = {}) {
-		// String path: plain prompts carry no files, no splitting needed.
 		if (!(promptOrMessage instanceof ClaudeMessage)) {
-			const {
-				model = null,
-				parentMessageUuid = '00000000-0000-4000-8000-000000000000',
-				attachments = [],
-				files = [],
-				syncSources = [],
-			} = options;
-
-			const requestBody = {
-				prompt: promptOrMessage,
-				parent_message_uuid: parentMessageUuid,
-				attachments,
-				files,
-				sync_sources: syncSources,
-				rendering_mode: "messages"
-			};
-
-			if (model !== null) {
-				requestBody.model = model;
-			}
-
-			return this._postCompletionAndAwaitAssistant(requestBody);
+			const { model = null, parentMessageUuid = ROOT_MESSAGE_UUID } = options;
+			return this._sendAndAwaitAssistant({ text: promptOrMessage, parentMessageUuid, model });
 		}
 
 		const msg = promptOrMessage;
-		const completionFiles = msg._getCompletionFiles();
+		const send = msg.toSendMessage();
+		if (options.model) send.model = options.model;
+		if (send.attachments.length <= MAX_FILES_PER_MESSAGE) return this._sendAndAwaitAssistant(send);
 
-		// Non-split path: file count within the per-message cap.
-		if (completionFiles.length <= MAX_FILES_PER_MESSAGE) {
-			const requestBody = msg.toCompletionJSON();
-			if (options.model) requestBody.model = options.model;
-			return this._postCompletionAndAwaitAssistant(requestBody);
-		}
-
-		// Split path: chunk files across N sends. Intermediate "filler" sends
-		// carry only files + placeholder text; the final send carries the real
-		// prompt, attachments, styles, sync_sources, and the last file chunk.
+		// Too many files for one message: intermediate "filler" sends carry only a file chunk and a
+		// placeholder text; the final send carries the real text, the inline attachments and the
+		// last chunk.
 		const chunks = [];
-		for (let i = 0; i < completionFiles.length; i += MAX_FILES_PER_MESSAGE) {
-			chunks.push(completionFiles.slice(i, i + MAX_FILES_PER_MESSAGE));
+		for (let i = 0; i < send.attachments.length; i += MAX_FILES_PER_MESSAGE) {
+			chunks.push(send.attachments.slice(i, i + MAX_FILES_PER_MESSAGE));
 		}
-		const fillerChunks = chunks.slice(0, -1);
-		const lastChunk = chunks[chunks.length - 1];
-
-		let parentUuid = msg.parent_message_uuid;
-		for (let i = 0; i < fillerChunks.length; i++) {
-			const fillerBody = {
-				prompt: `[Forking chat in progress -> Uploading file batch ${i + 1}/${chunks.length} — please reply with "ok" so the next batch can be sent. Context will be in the last batch.]`,
-				parent_message_uuid: parentUuid,
-				timezone: msg.timezone,
-				locale: msg.locale,
-				model: options.model ?? msg.model,
-				tools: msg.tools,
-				attachments: [],
-				files: fillerChunks[i].map(f => f.file_uuid),
-				sync_sources: [],
-				rendering_mode: msg.rendering_mode
-			};
-			const fillerAsst = await this._postCompletionAndAwaitAssistant(fillerBody);
+		let parentUuid = send.parentMessageUuid;
+		for (let i = 0; i < chunks.length - 1; i++) {
+			const fillerAsst = await this._sendAndAwaitAssistant({
+				...send,
+				text: `[Forking chat in progress -> Uploading file batch ${i + 1}/${chunks.length} — please reply with "ok" so the next batch can be sent. Context will be in the last batch.]`,
+				parentMessageUuid: parentUuid,
+				attachments: chunks[i],
+				inlineAttachments: [],
+			});
 			parentUuid = fillerAsst.uuid;
 		}
-
-		const finalBody = msg.toCompletionJSON();
-		finalBody.parent_message_uuid = parentUuid;
-		finalBody.files = lastChunk.map(f => f.file_uuid);
-		if (options.model) finalBody.model = options.model;
-		return this._postCompletionAndAwaitAssistant(finalBody);
+		return this._sendAndAwaitAssistant({ ...send, parentMessageUuid: parentUuid, attachments: chunks[chunks.length - 1] });
 	}
 
 	async _patchAccountSettingsIfNeeded() {
@@ -305,75 +313,98 @@ class ClaudeConversation {
 		};
 	}
 
-	async _postCompletionAndAwaitAssistant(requestBody) {
-		let settingsToRestore = null;
+	// One merged-experience action on this conversation (Connect's JSON codec, so it works from either
+	// world without the protobuf schema). A 200 only means accepted: success or failure arrives on the
+	// StreamTimeline as a mutation ack. The RPCs check Origin: a Firefox content script's own fetch
+	// sends the extension's, so it uses the page's (content.fetch); elsewhere plain fetch already
+	// sends claude.ai's.
+	async _performAction(action) {
+		const pageFetch = globalThis.content?.fetch?.bind(globalThis.content) ?? fetch;
+		return pageFetch(...ClaudeExtNet.bardRpcRequest('PerformAction', this.orgId, JSON.stringify({
+			header: {
+				conversationId: this.conversationId,
+				mutationId: { sessionId: `sess_qol${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`, version: '1' },
+			},
+			...action,
+		})));
+	}
 
-		if (!this.created) {
-			if (this._pendingCreateParams) {
-				requestBody.create_conversation_params = { ...this._pendingCreateParams };
-			}
-			settingsToRestore = await this._patchAccountSettingsIfNeeded();
-		}
+	// Sends one message through PerformAction's send_message (the legacy /completion endpoint refuses
+	// upgraded chats with 409 conversation_upgraded), then waits for the reply in the conversation
+	// tree. We choose both message ids, so the reply is known before it exists. On a new conversation
+	// the send creates it (the header's conversation id is the one prepareNew chose); send_message
+	// has no name, so the name is set after. `send` is { text, parentMessageUuid, model, timezone,
+	// locale, attachments: [{ id, fileName, fileSize, mediaType }], inlineAttachments: [{ fileName,
+	// fileSize, fileType, extractedContent }] }; timezone, locale and the attachment lists default to
+	// the browser's zone, the account locale and none.
+	async _sendAndAwaitAssistant(send) {
+		const creating = !this.created;
+		const createParams = this._pendingCreateParams;
+		const settingsToRestore = creating ? await this._patchAccountSettingsIfNeeded() : null;
 
 		try {
-			const requestSentTime = new Date().toISOString();
+			const messageId = this.generateUuid();
+			const assistantId = this.generateUuid();
+			const model = send.model ?? createParams?.model ?? null;
+			const sendMessage = {
+				messageId,
+				assistantMessageId: assistantId,
+				text: send.text,
+				timezone: send.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+				locale: send.locale ?? accountLocale(),
+				attachments: send.attachments ?? [],
+				inlineAttachments: send.inlineAttachments ?? [],
+			};
+			// Always explicit: left out, the server continues its own current leaf. "" is a new root
+			// (what the root uuid meant to /completion), and also what a conversation's first send uses.
+			const toRoot = !send.parentMessageUuid || send.parentMessageUuid === ROOT_MESSAGE_UUID;
+			sendMessage.parentMessageId = toRoot ? '' : send.parentMessageUuid;
+			if (model) sendMessage.model = { identifier: model };
+			if (creating && createParams?.project_uuid) sendMessage.projectId = createParams.project_uuid;
 
-			const response = await fetch(`/api/organizations/${this.orgId}/chat_conversations/${this.conversationId}/completion`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(requestBody)
-			});
-
+			const response = await this._performAction({ sendMessage });
 			if (!response.ok) {
-				apiLog.error(await response.json());
+				apiLog.error('send_message rejected:', response.status, await response.text().catch(() => ''));
 				throw new Error('Failed to send message');
 			}
-
-			if (!this.created) {
+			if (creating) {
 				this.created = true;
 				this._pendingCreateParams = null;
 			}
 
-			// Consume the stream, extracting the response UUID from the message_start event
-			let responseUuid = null;
-			await ClaudeExtNet.readSseEvents(response, (event) => {
-				if (!responseUuid && event.raw.includes('"message_start"')) {
-					responseUuid = event.data?.message?.uuid ?? null;
-					apiLog('Got response UUID from message_start:', responseUuid);
+			// The reply is done once the tree has it with a stop reason. A rejected send is only
+			// reported on the stream, so: our message showing up in the tree means accepted, and then
+			// the reply gets as long as it needs (a big-model summary of a long chat can take minutes;
+			// the cap only stops a turn that died from hanging forever). Never showing up within a
+			// minute means rejected. Polled with a plain fetch, not getData() (no conversation-cache
+			// write per poll; a brand-new conversation can 404 for a moment), backing off so a long
+			// turn doesn't re-download the tree every second.
+			const treeUrl = this._treeUrl();
+			const started = Date.now();
+			let accepted = false;
+			let interval = 1500;
+			while (Date.now() - started < (accepted ? 20 * 60_000 : 60_000)) {
+				await new Promise(r => setTimeout(r, interval));
+				interval = Math.min(interval * 1.5, 8000);
+				const tree = await fetch(treeUrl);
+				if (!tree.ok) continue;
+				const data = await tree.json();
+				accepted ||= data.chat_messages?.some(m => m.uuid === messageId) ?? false;
+				const reply = data.chat_messages?.find(m => m.uuid === assistantId);
+				if (reply?.stop_reason) {
+					this.conversationData = data;
+					this._syncAccountFeatureSettings();
+					// Named now that the conversation surely exists. A missing name isn't worth failing
+					// the send over, so a failed rename is only logged.
+					if (creating && createParams?.name && data.name !== createParams.name) {
+						const renamed = await this._performAction({ renameConversation: { title: createParams.name } }).catch(e => e);
+						if (!renamed?.ok) apiLog.warn('Could not name the new conversation:', renamed?.status ?? renamed);
+						else this.conversationData.name = createParams.name;
+					}
+					return ClaudeMessage.fromHistoryJSON(this, reply);
 				}
-				if (event.event === 'message_stop' || event.raw.includes('"type":"message_stop"')) return false;
-			});
-
-			// Find the assistant response by UUID (or fall back to timestamp)
-			let assistantMessage;
-			let attempts = 0;
-			let messages;
-			const maxAttempts = 30;
-
-			while (!assistantMessage && attempts < maxAttempts) {
-				if (attempts > 0) {
-					apiLog(`Assistant message not found, waiting 3 seconds and retrying (attempt ${attempts}/${maxAttempts})...`);
-					await new Promise(r => setTimeout(r, 3000));
-				}
-				messages = await this.getMessages(false, true);
-				if (responseUuid) {
-					assistantMessage = messages.find(msg => msg.uuid === responseUuid);
-				} else {
-					assistantMessage = messages.find(msg =>
-						msg.sender === 'assistant' &&
-						msg.created_at > requestSentTime
-					);
-				}
-				attempts++;
 			}
-
-			if (!assistantMessage) {
-				apiLog.error('Messages after retry:', messages.map(m => `${m.sender}:${m.uuid}`));
-				apiLog.error('Response UUID:', responseUuid, 'requestSentTime:', requestSentTime);
-				throw new Error('Completion finished but no assistant message found after retry');
-			}
-
-			return assistantMessage;
+			throw new Error(accepted ? 'The reply never finished' : 'The message was not accepted');
 		} finally {
 			if (settingsToRestore) {
 				await updateAccountSettings(settingsToRestore);
@@ -432,6 +463,11 @@ class ClaudeConversation {
 		}
 	}
 
+	// The whole tree, every branch and tool call.
+	_treeUrl() {
+		return `/api/organizations/${this.orgId}/chat_conversations/${this.conversationId}?tree=true&rendering_mode=messages&render_all_tools=true&consistency=strong`;
+	}
+
 	// Lazy load conversation data (always fetches full tree)
 	// Uses IndexedDB cache with streaming freshness check to avoid downloading large payloads.
 	//
@@ -448,7 +484,7 @@ class ClaudeConversation {
 			return this.conversationData;
 		}
 
-		const apiUrl = `/api/organizations/${this.orgId}/chat_conversations/${this.conversationId}?tree=true&rendering_mode=messages&render_all_tools=true&skip_uuid_injection=true&consistency=strong`;
+		const apiUrl = this._treeUrl();
 
 		// Try cache (unless forcing refresh)
 		if (!forceRefresh) {
@@ -506,12 +542,12 @@ class ClaudeConversation {
 		return result.data;
 	}
 
-	// Reconstruct the current trunk from full tree data: walk from current leaf to root
-	_trunkFrom(data) {
+	// Reconstruct a branch from full tree data: walk from a leaf (default: the current one) to root
+	_trunkFrom(data, leafId = data.current_leaf_message_uuid) {
 		const allMessages = data.chat_messages || [];
 		const messageMap = new Map(allMessages.map(msg => [msg.uuid, msg]));
 		const trunk = [];
-		let currentId = data.current_leaf_message_uuid;
+		let currentId = leafId;
 
 		while (currentId && currentId !== ROOT_MESSAGE_UUID) {
 			const msg = messageMap.get(currentId);
@@ -525,9 +561,8 @@ class ClaudeConversation {
 	}
 
 	// Get messages - when tree=false, reconstructs the current trunk from full tree data.
-	// Never includes phantom messages: getData passes skip_uuid_injection=true, so the
-	// phantom interceptor leaves our own requests alone. Use getRenderedMessages() when you
-	// need the list the UI is actually showing.
+	// Never includes phantom messages: use getRenderedMessages() when you need the list the UI is
+	// actually showing.
 	async getMessages(tree = false, forceRefresh = false) {
 		const data = await this.getData(forceRefresh);
 
@@ -538,11 +573,19 @@ class ClaudeConversation {
 		return this._trunkFrom(data);
 	}
 
+	// The messages from the root down to messageId, whichever branch it's on (the server's current
+	// branch or not, e.g. one viewed with the version arrows or a jump).
+	async getMessagesTo(messageId, forceRefresh = false) {
+		return this._trunkFrom(await this.getData(forceRefresh), messageId);
+	}
+
 	// The current branch as the UI renders it: phantom (forked-in) history first, then the
 	// real messages. Anything that has to line up with what's on screen — locating a row,
-	// counting positions — needs this rather than getMessages().
+	// counting positions — needs this rather than getMessages(). During a jump (jump-view.js) the
+	// page shows the jumped branch, so that's the one built.
 	async getRenderedMessages(forceRefresh = false) {
 		const data = await this.getData(forceRefresh);
+		const leafId = qolJumpedLeaf(this.conversationId) ?? data.current_leaf_message_uuid;
 
 		let phantoms = null;
 		try {
@@ -550,14 +593,11 @@ class ClaudeConversation {
 		} catch (error) {
 			apiLog.error('Failed to load phantom messages:', error);
 		}
-		if (!phantoms?.length) return this._trunkFrom(data);
+		if (!phantoms?.length) return this._trunkFrom(data, leafId);
 
-		// MAIN world hands back hydrated ClaudeMessages, ISOLATED raw history JSON.
-		const phantomJson = phantoms.map(msg => msg.toHistoryJSON ? msg.toHistoryJSON() : msg);
-
-		// Non-mutating: `data` is cached on this instance and in IndexedDB, and must stay
-		// phantom-free so getMessages() keeps returning the real branch.
-		return this._trunkFrom(stitchPhantomMessages(data, phantomJson, { mutate: false }));
+		// With the ids the page shows them under, so rows and positions line up. `data` stays
+		// phantom-free (it's cached), so getMessages() keeps returning the real branch.
+		return this._trunkFrom(stitchPhantomMessages(data, pagePhantoms(phantoms)), leafId);
 	}
 
 	// Find longest leaf from a message ID
@@ -600,19 +640,15 @@ class ClaudeConversation {
 		return longestPath;
 	}
 
-	// Navigate to a specific leaf
+	// Navigate to a specific leaf (it must have no children), then reload onto it.
+	// Through the merged experience's set_current_leaf: the legacy PUT also moves the leaf, but the
+	// StreamTimeline snapshot can keep serving the old one for a while after it, so the reload landed
+	// on the wrong branch.
 	async setCurrentLeaf(leafId) {
-		const url = `/api/organizations/${this.orgId}/chat_conversations/${this.conversationId}/current_leaf_message_uuid`;
-
-		const response = await fetch(url, {
-			method: 'PUT',
-			credentials: 'include',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ current_leaf_message_uuid: leafId })
-		});
+		const response = await this._performAction({ setCurrentLeaf: { currentLeafMessageId: leafId } });
 
 		if (!response.ok) {
-			throw new Error('Failed to set current leaf');
+			throw new Error(`Failed to set current leaf (${response.status})`);
 		}
 
 		// Bust the react-query cache before reloading
@@ -1161,13 +1197,11 @@ class ClaudeMessage {
 		this.sync_sources = [];
 		this.truncated = false;
 
-		// Completion-specific (defaults)
+		// Sending (defaults)
 		this.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 		this.locale = accountLocale();
 
 		this.model = null;
-		this.tools = [];
-		this.rendering_mode = 'messages';
 
 		if (historyJson) {
 			this._parseFromHistory(historyJson);
@@ -1358,26 +1392,11 @@ class ClaudeMessage {
 		);
 	}
 
-	// Returns only files that will land in files_completion (subject to the
-	// per-message limit). Mirrors the classification in _getFilesJSON so the
-	// two cannot drift.
-	_getCompletionFiles() {
-		const ATTACHMENT_CHAR_LIMIT = 15000;
-		return this._files.filter(f => {
-			if (f instanceof ClaudeAttachment) return false;
-			if (f instanceof ClaudeCodeExecutionFile) {
-				const inlined = f.extracted_content !== null &&
-					(f.force_attachment_mode || f.extracted_content.length <= ATTACHMENT_CHAR_LIMIT);
-				return !inlined;
-			}
-			return true; // ClaudeFile
-		});
-	}
-
+	// files_send: the file objects sent as attachments (the rest go inline, in `attachments`).
 	_getFilesJSON() {
 		const ATTACHMENT_CHAR_LIMIT = 15000;
 		const files_v2 = [];
-		const files_completion = [];
+		const files_send = [];
 		const files_history = [];
 		const attachments = [];
 
@@ -1405,7 +1424,7 @@ class ClaudeMessage {
 					// Large files or non-text: include in files array
 					const apiFormat = f.toApiFormat();
 					files_v2.push(apiFormat);
-					files_completion.push(f.file_uuid);
+					files_send.push(f);
 
 					// Images go in files_history
 					if (f.file_kind === 'image') {
@@ -1416,7 +1435,7 @@ class ClaudeMessage {
 				// ClaudeFile
 				const apiFormat = f.toApiFormat();
 				files_v2.push(apiFormat);
-				files_completion.push(f.file_uuid);
+				files_send.push(f);
 
 				// Only images go in files_history
 				if (f.file_kind === 'image') {
@@ -1425,7 +1444,7 @@ class ClaudeMessage {
 			}
 		}
 
-		return { files_v2, files_completion, files_history, attachments };
+		return { files_v2, files_send, files_history, attachments };
 	}
 
 	// toHistoryJSON - use files_history
@@ -1449,34 +1468,41 @@ class ClaudeMessage {
 		};
 	}
 
-	toCompletionJSON() {
-		// Validate: can only send human messages
+	// This message as a send for ClaudeConversation._sendAndAwaitAssistant: uploaded files become
+	// attachments (by file id), text files inline attachments.
+	toSendMessage() {
 		if (this.sender !== 'human') {
-			throw new Error('Cannot send non-human message as completion');
+			throw new Error('Cannot send a non-human message');
 		}
 
-		// Extract prompt from content
 		const textBlocks = this.content.filter(c => c.type === 'text');
 		if (textBlocks.length === 0) {
 			throw new Error('Message has no text content');
 		}
 		if (textBlocks.length > 1) {
-			throw new Error('Cannot send message with multiple text blocks as completion');
+			throw new Error('Cannot send a message with multiple text blocks');
 		}
 
-		const { files_completion, attachments } = this._getFilesJSON();
+		const { files_send, attachments } = this._getFilesJSON();
 
 		return {
-			prompt: textBlocks[0].text,
-			parent_message_uuid: this.parent_message_uuid,
+			text: textBlocks[0].text,
+			parentMessageUuid: this.parent_message_uuid,
 			timezone: this.timezone,
 			locale: this.locale,
 			model: this.model,
-			tools: this.tools,
-			attachments,
-			files: files_completion,
-			sync_sources: this.sync_sources,
-			rendering_mode: this.rendering_mode
+			attachments: files_send.map(f => ({
+				id: f.file_uuid,
+				fileName: f.file_name,
+				fileSize: String(f.size_bytes ?? f.raw_data?.size_bytes ?? 0),
+				mediaType: mime.getType(f.file_name) || 'application/octet-stream',
+			})),
+			inlineAttachments: attachments.map(a => ({
+				fileName: a.file_name,
+				fileSize: String(a.file_size ?? a.extracted_content.length),
+				fileType: a.file_type || 'text/plain',
+				extractedContent: a.extracted_content,
+			})),
 		};
 	}
 
@@ -1512,6 +1538,18 @@ class ClaudeMessage {
 	}
 }
 
+// Save a blob as a download named filename.
+function saveBlob(blob, filename) {
+	const url = URL.createObjectURL(blob);
+	const a = document.createElement('a');
+	a.href = url;
+	a.download = filename;
+	document.body.appendChild(a);
+	a.click();
+	a.remove();
+	URL.revokeObjectURL(url);
+}
+
 class ClaudeProject {
 	constructor(orgId, projectId) {
 		this.orgId = orgId;
@@ -1531,15 +1569,6 @@ class ClaudeProject {
 			this.projectData = await response.json();
 		}
 		return this.projectData;
-	}
-
-	// Get syncs
-	async getSyncs() {
-		const response = await fetch(`/api/organizations/${this.orgId}/projects/${this.projectId}/syncs`);
-		if (!response.ok) {
-			throw new Error('Failed to fetch project syncs');
-		}
-		return await response.json();
 	}
 
 	// Get docs (attachments) - always fetch, but cache result
@@ -1562,177 +1591,34 @@ class ClaudeProject {
 		return this.cachedFiles;
 	}
 
-	// Download attachment (doc) - content is already in the docs response
+	// A project file's original bytes. The asset URLs in /files are previews: images come back as a
+	// downscaled WebP, and only PDFs have their original as document_asset.
+	contentsUrl(file) {
+		return `/api/organizations/${this.orgId}/files/${file.file_uuid}/contents`;
+	}
+
+	// The name to save a doc (text knowledge, from /docs) under. Documents claude.ai converts to text on
+	// upload (Word, Excel, PowerPoint, OpenDocument, RTF, EPUB) keep only that text, so they get ".txt"
+	// added: their original name would promise a file the text isn't.
+	static docFileName(doc) {
+		const name = doc.file_name || 'document';
+		return /\.(docx?|xlsx?|pptx?|od[tsp]|rtf|epub)$/i.test(name) ? `${name}.txt` : name;
+	}
+
+	// Download a doc: its text is already in the /docs response.
 	async downloadAttachment(docId) {
-		// Read from cache if available
-		if (!this.cachedDocs) {
-			await this.getDocs();
-		}
-
-		const doc = this.cachedDocs.find(d => d.uuid === docId);
-
-		if (!doc) {
-			throw new Error(`Doc ${docId} not found`);
-		}
-
-		// Create blob from content
-		const blob = new Blob([doc.content], { type: 'text/plain' });
-
-		// Trigger download
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = doc.file_name;
-		document.body.appendChild(a);
-		a.click();
-		document.body.removeChild(a);
-		URL.revokeObjectURL(url);
+		const doc = (this.cachedDocs ?? await this.getDocs()).find(d => d.uuid === docId);
+		if (!doc) throw new Error(`Doc ${docId} not found`);
+		saveBlob(new Blob([doc.content], { type: 'text/plain' }), ClaudeProject.docFileName(doc));
 	}
 
-	// Download file - needs to determine URL based on file type
+	// Download a file (from /files) as uploaded.
 	async downloadFile(fileId) {
-		// Read from cache if available
-		if (!this.cachedFiles) {
-			await this.getFiles();
-		}
-
-		const file = this.cachedFiles.find(f => f.file_uuid === fileId);
-
-		if (!file) {
-			throw new Error(`File ${fileId} not found`);
-		}
-
-		let downloadUrl;
-
-		// Determine download URL based on file type
-		if (file.file_kind === 'document' && file.document_asset) {
-			// PDF or document - use document_asset URL
-			downloadUrl = file.document_asset.url;
-		} else if (file.file_kind === 'image') {
-			// Image - prefer preview_url over thumbnail_url
-			downloadUrl = file.preview_url || file.thumbnail_url;
-
-			// Or look for original asset if available
-			if (file.preview_asset?.file_variant === 'original') {
-				downloadUrl = file.preview_asset.url;
-			} else if (file.thumbnail_asset?.file_variant === 'original') {
-				downloadUrl = file.thumbnail_asset.url;
-			}
-		} else {
-			// Fallback to preview_url if available
-			downloadUrl = file.preview_url || file.thumbnail_url;
-		}
-
-		if (!downloadUrl) {
-			throw new Error(`No download URL found for file ${fileId}`);
-		}
-
-		// Fetch the actual file content
-		const response = await fetch(downloadUrl);
-		if (!response.ok) {
-			throw new Error(`Failed to download file ${fileId}`);
-		}
-
-		const blob = await response.blob();
-
-		// Trigger download
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = file.file_name;
-		document.body.appendChild(a);
-		a.click();
-		document.body.removeChild(a);
-		URL.revokeObjectURL(url);
-	}
-
-
-	// Download all files and attachments as a zip
-	async downloadAll() {
-
-		// Fetch project data and file lists
-		const [projectData, docs, files] = await Promise.all([
-			this.getData(),
-			this.getDocs(),
-			this.getFiles()
-		]);
-
-		const projectName = projectData.name || 'project';
-
-		// Create zip
-		const zip = new JSZip();
-
-		// Add docs (content is already available)
-		for (const doc of docs) {
-			// Add UUID to filename to avoid collisions
-			const filename = this._makeUniqueFilename(doc.file_name, doc.uuid);
-			await addToZip(zip, filename, doc.content);
-		}
-
-		// Fetch and add files
-		for (const file of files) {
-			let downloadUrl;
-
-			// Determine download URL based on file type
-			if (file.file_kind === 'document' && file.document_asset) {
-				downloadUrl = file.document_asset.url;
-			} else if (file.file_kind === 'image') {
-				downloadUrl = file.preview_url || file.thumbnail_url;
-
-				if (file.preview_asset?.file_variant === 'original') {
-					downloadUrl = file.preview_asset.url;
-				} else if (file.thumbnail_asset?.file_variant === 'original') {
-					downloadUrl = file.thumbnail_asset.url;
-				}
-			} else {
-				downloadUrl = file.preview_url || file.thumbnail_url;
-			}
-
-			if (!downloadUrl) {
-				continue;
-			}
-
-			try {
-				const response = await fetch(downloadUrl);
-				if (!response.ok) {
-					apiLog.error(`Failed to fetch ${file.file_name}`);
-					continue;
-				}
-				const blob = await response.blob();
-
-				// Add UUID to filename to avoid collisions
-				const filename = this._makeUniqueFilename(file.file_name, file.file_uuid);
-				await addToZip(zip, filename, blob);
-			} catch (error) {
-				apiLog.error(`Error downloading ${file.file_name}:`, error);
-			}
-		}
-
-		// Generate zip and trigger download
-		const zipBlob = await zip.generateAsync({ type: 'blob' });
-
-		const url = URL.createObjectURL(zipBlob);
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = `${projectName}.zip`;
-		document.body.appendChild(a);
-		a.click();
-		document.body.removeChild(a);
-		URL.revokeObjectURL(url);
-	}
-
-	// Helper to make unique filenames
-	_makeUniqueFilename(filename, uuid) {
-		// Split filename into name and extension
-		const lastDot = filename.lastIndexOf('.');
-		if (lastDot === -1) {
-			// No extension
-			return `${filename}-${uuid}`;
-		}
-
-		const name = filename.substring(0, lastDot);
-		const ext = filename.substring(lastDot);
-		return `${name}-${uuid}${ext}`;
+		const file = (this.cachedFiles ?? await this.getFiles()).find(f => f.file_uuid === fileId);
+		if (!file) throw new Error(`File ${fileId} not found`);
+		const response = await fetch(this.contentsUrl(file));
+		if (!response.ok) throw new Error(`Failed to download file ${fileId} (${response.status})`);
+		saveBlob(await response.blob(), file.file_name);
 	}
 }
 
@@ -1974,4 +1860,4 @@ const CLAUDE_MODELS = [
 ]
 
 const DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5';
-const FAST_MODEL = 'claude-haiku-4-5-20251001';
+const FAST_MODEL = 'claude-haiku-5-5';

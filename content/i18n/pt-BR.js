@@ -35,6 +35,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['pt-BR'] ??= {}, {
 	"nav.message_uuid_not_found": "Não foi possível encontrar o UUID da mensagem",
 	"nav.success_title": "Sucesso",
 	"nav.bookmark_added": "Favorito adicionado!",
+	"nav.continue_anyway_text": "QoL: você também pode continuar esta versão aqui.",
+	"nav.continue_anyway_button": "Continuar daqui",
+	"nav.continuing": "Mudando para esta versão...",
+	"nav.continue_upgraded_text": "QoL: este chat não pode continuar uma versão anterior no mesmo lugar, porque os arquivos são compartilhados entre as versões. Você pode bifurcá-la em vez disso.",
+	"nav.jump_view_text": "QoL: você está vendo uma versão anterior deste chat. O envio está pausado aqui.",
+	"nav.back_to_latest": "Voltar para a mais recente",
 
 	// search
 	"search.branched_messages_ago": "Ramificada há {n} mensagens",
@@ -195,7 +201,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['pt-BR'] ??= {}, {
 	"tts.model_label": "Modelo",
 	"tts.custom_model_hint": "Nome do modelo para o endpoint personalizado",
 	"tts.auto_speak": "Ler automaticamente novas mensagens",
-	"tts.auto_speak_note": "Funciona apenas em chats normais (não no cowork nem no code)",
+	"tts.auto_speak_note": "Funciona apenas em chats normais (não no code)",
 	"tts.per_chat_heading": "Configurações por chat",
 	"tts.quotes_only": "Ler apenas texto entre aspas",
 	"tts.quotes_only_tooltip": "Reprodução rápida só dos diálogos usando regex (instantânea, sem chamada de API)",
@@ -282,6 +288,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['pt-BR'] ??= {}, {
 	"fork.creating": "Criando a conversa bifurcada...",
 	"fork.complete_redirecting": "Bifurcação concluída! Redirecionando...",
 	"fork.fork_failed": "Não foi possível bifurcar a conversa: {error}",
+	"fork.upgraded_warning": "Este chat roda em um ambiente na nuvem: o chat bifurcado não incluirá nenhum arquivo criado lá!",
 	"fork.files_not_transferred": "Os seguintes arquivos não puderam ser transferidos para a conversa bifurcada:",
 	"fork.file_transfer_warning": "Aviso de transferência de arquivos",
 	"fork.upload_failed_title": "Falha no envio do arquivo",
@@ -326,8 +333,6 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['pt-BR'] ??= {}, {
 	// images
 	"images.generated_image": "Imagem gerada",
 	"images.generated_images": "Imagens geradas",
-	"images.generated_for": "Imagem gerada para: {prompt}",
-	"images.generated_title": "Gerada: {prompt}",
 
 	// models
 	"models.opus_notice": "O Opus consome os limites de uso mais rápido que outros modelos",
@@ -355,4 +360,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['pt-BR'] ??= {}, {
 
 	// main
 	"main.rich_copy_no_text": "Nenhum conteúdo de texto encontrado",
+
+	// account
+	"account.legacy_title": "Sua conta ainda não está no novo claude.ai",
+	"account.legacy_body": "Esta versão do Claude QoL precisa da nova experiência do claude.ai, que ainda não chegou à sua conta. Os recursos de chat não funcionarão até lá.",
+
+	// settings
+	"settings.full_load": "Carregar conversas inteiras",
+	"settings.full_load_hint": "Carrega todas as mensagens ao abrir um chat, para que Ctrl+F, a busca no chat e os favoritos alcancem mensagens antigas. Desative se chats longos ficarem lentos.",
 });

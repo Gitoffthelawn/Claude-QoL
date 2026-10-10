@@ -35,6 +35,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['fr'] ??= {}, {
 	"nav.message_uuid_not_found": "UUID du message introuvable",
 	"nav.success_title": "Succès",
 	"nav.bookmark_added": "Signet ajouté !",
+	"nav.continue_anyway_text": "QoL : vous pouvez aussi continuer cette version ici.",
+	"nav.continue_anyway_button": "Continuer à partir d'ici",
+	"nav.continuing": "Passage à cette version...",
+	"nav.continue_upgraded_text": "QoL : ce chat ne peut pas continuer une version antérieure sur place, car ses fichiers sont partagés entre les versions. Vous pouvez la bifurquer à la place.",
+	"nav.jump_view_text": "QoL : vous consultez une version antérieure de ce chat. L'envoi est en pause ici.",
+	"nav.back_to_latest": "Revenir à la dernière",
 
 	// search
 	"search.branched_messages_ago": "Branche créée il y a {n} messages",
@@ -195,7 +201,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['fr'] ??= {}, {
 	"tts.model_label": "Modèle",
 	"tts.custom_model_hint": "Nom du modèle pour le point de terminaison personnalisé",
 	"tts.auto_speak": "Lecture auto des nouveaux messages",
-	"tts.auto_speak_note": "Fonctionne uniquement dans les chats normaux (pas cowork, pas code)",
+	"tts.auto_speak_note": "Fonctionne uniquement dans les chats normaux (pas code)",
 	"tts.per_chat_heading": "Paramètres par chat",
 	"tts.quotes_only": "Lire uniquement le texte entre guillemets",
 	"tts.quotes_only_tooltip": "Lecture rapide des dialogues seuls via regex (instantané, sans appel API)",
@@ -282,6 +288,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['fr'] ??= {}, {
 	"fork.creating": "Création de la conversation bifurquée...",
 	"fork.complete_redirecting": "Bifurcation terminée ! Redirection...",
 	"fork.fork_failed": "Impossible de bifurquer la conversation : {error}",
+	"fork.upgraded_warning": "Ce chat s'exécute dans un environnement cloud : le chat dérivé n'inclura aucun des fichiers créés là-bas !",
 	"fork.files_not_transferred": "Les fichiers suivants n'ont pas pu être transférés vers la conversation bifurquée :",
 	"fork.file_transfer_warning": "Avertissement de transfert de fichiers",
 	"fork.upload_failed_title": "Échec de l'envoi du fichier",
@@ -326,8 +333,6 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['fr'] ??= {}, {
 	// images
 	"images.generated_image": "Image générée",
 	"images.generated_images": "Images générées",
-	"images.generated_for": "Image générée pour : {prompt}",
-	"images.generated_title": "Généré : {prompt}",
 
 	// models
 	"models.opus_notice": "Opus consomme les limites d'utilisation plus rapidement que les autres modèles",
@@ -355,4 +360,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['fr'] ??= {}, {
 
 	// main
 	"main.rich_copy_no_text": "Aucun contenu texte trouvé",
+
+	// account
+	"account.legacy_title": "Votre compte n'est pas encore sur le nouveau claude.ai",
+	"account.legacy_body": "Cette version de Claude QoL a besoin de la nouvelle expérience de claude.ai, qui n'est pas encore arrivée sur votre compte. Ses fonctions de chat ne marcheront pas d'ici là.",
+
+	// settings
+	"settings.full_load": "Charger les conversations entières",
+	"settings.full_load_hint": "Charge tous les messages à l'ouverture d'un chat, pour que Ctrl+F, la recherche dans le chat et les signets atteignent les anciens messages. Désactivez-le si les longs chats semblent lents.",
 });

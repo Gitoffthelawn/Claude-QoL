@@ -42,8 +42,7 @@ If this is a writing or creative discussion, include sections for characters, pl
 			e.preventDefault();
 			e.stopPropagation();
 
-			const messageContainer = e.target.closest('[data-message-uuid]');
-			const messageUuid = messageContainer?.dataset.messageUuid;
+			const messageUuid = await messageUuidOfElement(e.target);
 
 			if (!messageUuid) {
 				showClaudeAlert(localize('common.error'), localize('fork.no_message_uuid'));
@@ -58,14 +57,17 @@ If this is a writing or creative discussion, include sections for characters, pl
 	}
 
 	async function createConfigModal(messageUuid) {
-		// Pre-fetch messages for token estimation (fire-and-forget)
+		// Pre-fetch messages for token estimation; the fork itself reuses them.
 		const conversationId = getConversationId();
 		const orgId = getOrgId();
 		let fetchedMessages = null;
 		let totalTokens = null;
 
-		getConversationMessages(orgId, conversationId, messageUuid)
+		const prefetched = getConversationMessages(orgId, conversationId, messageUuid);
+		prefetched
 			.then(result => {
+				// An upgraded (workspace) chat's sandbox files live only in its cloud environment.
+				if (result.conversationData.workspace_upgraded) upgradedWarning.style.display = '';
 				fetchedMessages = result.messages;
 				totalTokens = estimateTokens(fetchedMessages);
 				percentInput.disabled = false;
@@ -83,6 +85,13 @@ If this is a writing or creative discussion, include sections for characters, pl
 		// --- LEFT PANEL ---
 		const leftPanel = document.createElement('div');
 		leftPanel.className = 'flex-1 min-w-0';
+
+		// Shown once the conversation data says the chat is upgraded (see the fetch above).
+		const upgradedWarning = document.createElement('div');
+		upgradedWarning.className = 'mb-4 p-3 rounded border border-border-300 text-sm text-text-100';
+		upgradedWarning.textContent = `⚠️ ${localize('fork.upgraded_warning')}`;
+		upgradedWarning.style.display = 'none';
+		leftPanel.appendChild(upgradedWarning);
 
 		// Model select
 		const selectOptions = CLAUDE_MODELS;
@@ -289,7 +298,7 @@ If this is a writing or creative discussion, include sections for characters, pl
 			pendingFork.useSelectedModelForSummary = useSelectedModelToggle.input.checked;
 
 			modal.destroy();
-			await forkConversationClicked(messageUuid);
+			await forkConversationClicked(messageUuid, prefetched);
 			return false;
 		});
 
@@ -298,7 +307,7 @@ If this is a writing or creative discussion, include sections for characters, pl
 
 	//#endregion
 
-	async function forkConversationClicked(messageUuid) {
+	async function forkConversationClicked(messageUuid, prefetched) {
 		const loadingModal = createLoadingModal(localize('fork.preparing'));
 		loadingModal.show();
 		pendingFork.loadingModal = loadingModal;
@@ -312,7 +321,7 @@ If this is a writing or creative discussion, include sections for characters, pl
 			loadingModal.setContent(createLoadingContent(localize('fork.getting_messages')));
 
 			let { conversationData, messages } =
-				await getConversationMessages(orgId, conversationId, messageUuid);
+				await prefetched.catch(() => getConversationMessages(orgId, conversationId, messageUuid));
 
 			const chatName = conversationData.name;
 			const projectUuid = conversationData.project?.uuid || conversationData?.project_uuid || null;
@@ -478,16 +487,9 @@ If this is a writing or creative discussion, include sections for characters, pl
 	async function getConversationMessages(orgId, conversationId, targetUUID) {
 		const conversation = new ClaudeConversation(orgId, conversationId);
 		const conversationData = await conversation.getData();
-		const allMessages = await conversation.getMessages();
-
-		// Extract up to targetUUID as ClaudeMessage[]
-		const messages = [];
-		for (const message of allMessages) {
-			messages.push(message);
-			if (message.uuid === targetUUID) {
-				break;
-			}
-		}
+		// The branch down to the target, which needn't be the server's current one (version arrows,
+		// jumps).
+		const messages = await conversation.getMessagesTo(targetUUID);
 
 		return {
 			conversation,      // The ClaudeConversation instance
@@ -1346,6 +1348,20 @@ Provide the complete rewritten summary.`;
 	}
 
 	//#endregion
+
+	// "Fork from here" on the earlier-version banner (navigation.js, ISOLATED): the same modal as the
+	// fork button. It only opens the modal; the fork still needs the user's confirmation.
+	window.addEventListener('message', async (event) => {
+		if (event.source !== window || event.origin !== window.location.origin) return;
+		if (event.data?.type !== 'qol-fork-from') return;
+		const { messageUuid } = event.data;
+		if (typeof messageUuid !== 'string' || !/^[0-9a-f-]{36}$/i.test(messageUuid)) return;
+		try {
+			(await createConfigModal(messageUuid)).show();
+		} catch (error) {
+			log.error('Could not open the fork modal:', error);
+		}
+	});
 
 	MessageButtonBar.register({
 		buttonClass: 'fork-button',

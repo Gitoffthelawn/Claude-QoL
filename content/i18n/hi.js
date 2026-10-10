@@ -35,6 +35,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['hi'] ??= {}, {
 	"nav.message_uuid_not_found": "संदेश का UUID नहीं मिला",
 	"nav.success_title": "सफल",
 	"nav.bookmark_added": "बुकमार्क जोड़ा गया!",
+	"nav.continue_anyway_text": "QoL: आप इस संस्करण को यहीं जारी रख सकते हैं।",
+	"nav.continue_anyway_button": "यहाँ से जारी रखें",
+	"nav.continuing": "इस संस्करण पर जा रहे हैं...",
+	"nav.continue_upgraded_text": "QoL: यह चैट किसी पुराने संस्करण को यहीं जारी नहीं रख सकती, क्योंकि इसकी फ़ाइलें सभी संस्करणों में साझा होती हैं। इसके बजाय आप उसे फ़ोर्क कर सकते हैं।",
+	"nav.jump_view_text": "QoL: आप इस चैट का एक पुराना संस्करण देख रहे हैं। यहाँ भेजना रुका हुआ है।",
+	"nav.back_to_latest": "नवीनतम पर वापस जाएँ",
 
 	// search
 	"search.branched_messages_ago": "{n} संदेश पहले शाखा बनी",
@@ -195,7 +201,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['hi'] ??= {}, {
 	"tts.model_label": "मॉडल",
 	"tts.custom_model_hint": "कस्टम एंडपॉइंट के लिए मॉडल का नाम",
 	"tts.auto_speak": "नए संदेश पर अपने-आप बोलें",
-	"tts.auto_speak_note": "केवल सामान्य चैट में काम करता है (cowork या code में नहीं)",
+	"tts.auto_speak_note": "केवल सामान्य चैट में काम करता है (code में नहीं)",
 	"tts.per_chat_heading": "प्रति-चैट सेटिंग्स",
 	"tts.quotes_only": "केवल उद्धरण वाला टेक्स्ट बोलें",
 	"tts.quotes_only_tooltip": "regex से केवल संवाद का तेज़ प्लेबैक (तुरंत, कोई API कॉल नहीं)",
@@ -282,6 +288,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['hi'] ??= {}, {
 	"fork.creating": "फ़ोर्क की गई बातचीत बनाई जा रही है...",
 	"fork.complete_redirecting": "फ़ोर्क पूरा हुआ! रीडायरेक्ट हो रहा है...",
 	"fork.fork_failed": "बातचीत फ़ोर्क नहीं हो सकी: {error}",
+	"fork.upgraded_warning": "यह चैट एक क्लाउड वातावरण में चलती है: फ़ोर्क की गई चैट में वहाँ बनाई गई कोई भी फ़ाइल शामिल नहीं होगी!",
 	"fork.files_not_transferred": "नीचे दी गई फ़ाइलें फ़ोर्क की गई बातचीत में ट्रांसफ़र नहीं हो सकीं:",
 	"fork.file_transfer_warning": "फ़ाइल ट्रांसफ़र चेतावनी",
 	"fork.upload_failed_title": "फ़ाइल अपलोड विफल",
@@ -326,8 +333,6 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['hi'] ??= {}, {
 	// images
 	"images.generated_image": "जनरेट की गई इमेज",
 	"images.generated_images": "जनरेट की गई इमेज",
-	"images.generated_for": "इसके लिए जनरेट की गई इमेज: {prompt}",
-	"images.generated_title": "जनरेट किया गया: {prompt}",
 
 	// models
 	"models.opus_notice": "Opus अन्य मॉडलों की तुलना में उपयोग सीमा तेज़ी से खर्च करता है",
@@ -355,4 +360,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['hi'] ??= {}, {
 
 	// main
 	"main.rich_copy_no_text": "कोई टेक्स्ट सामग्री नहीं मिली",
+
+	// account
+	"account.legacy_title": "आपका खाता अभी नए claude.ai पर नहीं है",
+	"account.legacy_body": "Claude QoL के इस संस्करण को claude.ai का नया अनुभव चाहिए, जो अभी आपके खाते तक नहीं पहुँचा है। तब तक इसकी चैट सुविधाएँ काम नहीं करेंगी।",
+
+	// settings
+	"settings.full_load": "पूरी बातचीत लोड करें",
+	"settings.full_load_hint": "चैट खुलते ही सभी संदेश लोड करता है, ताकि Ctrl+F, चैट खोज और बुकमार्क पुराने संदेशों तक पहुँच सकें। अगर लंबी चैट धीमी लगें तो इसे बंद करें।",
 });

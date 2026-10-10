@@ -37,41 +37,11 @@
 		return btn;
 	}
 
-	function messageUuidOf(element) {
-		let el = element;
-		while (el && !el.hasAttribute('data-message-uuid')) el = el.parentElement;
-		return el?.getAttribute('data-message-uuid') ?? null;
-	}
-
-	// User messages carry no uuid of their own, so identify the clicked one through
-	// the assistant message next to it. Pairing the two selector lists by array
-	// index does NOT work: the list is virtualized, so the rendered window is an
-	// arbitrary slice that can start with either sender.
+	// The user message whose toolbar holds controlsContainer: user rows are keyed by their own uuid
+	// (data-turn-key, see message-ui.js).
 	function findExistingMessage(controlsContainer, messages) {
-		const { userMessages, assistantMessages } = getUIMessages();
-		const userElement = userMessages.find(msg => findMessageControls(msg) === controlsContainer);
-		if (!userElement) return null;
-
-		// The reply below it: its parent_message_uuid is the message we want.
-		const reply = assistantMessages.find(el =>
-			userElement.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
-		if (reply && areMessagesAdjacent(userElement, reply)) {
-			const apiReply = messages.find(m => m.uuid === messageUuidOf(reply));
-			const existing = apiReply && messages.find(m => m.uuid === apiReply.parent_message_uuid);
-			if (existing) return existing;
-		}
-
-		// The window can end on a user message, in which case the "next" assistant
-		// element is the pinned tail of the conversation rather than the reply.
-		// Fall back to the message above and take its child on this branch.
-		const preceding = assistantMessages.filter(el =>
-			userElement.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING).pop();
-		if (preceding && areMessagesAdjacent(preceding, userElement)) {
-			const parentUuid = messageUuidOf(preceding);
-			if (parentUuid) return messages.find(m => m.parent_message_uuid === parentUuid && m.sender === 'human');
-		}
-
-		return null;
+		const uuid = resolveUserMessageUuid(controlsContainer);
+		return uuid ? messages.find(m => m.uuid === uuid) ?? null : null;
 	}
 
 	function insertAdvancedEditButton(button, controlsContainer) {
@@ -153,7 +123,7 @@
 	}
 
 	// Give up after ~5s rather than retrying forever: a stuck pendingEditData would
-	// hijack the next unrelated completion request.
+	// hijack the next unrelated send.
 	const AUTO_SUBMIT_MAX_ATTEMPTS = 100;
 
 	function autoSubmitEditWithText(newText, attempt = 0) {
@@ -175,7 +145,7 @@
 		const { textarea, saveButton } = controls;
 		textarea.focus();
 		textarea.select();
-		// Always append a space to guarantee the UI detects a change — the fetch interceptor overwrites the text anyway
+		// Always append a space to guarantee the UI detects a change — the send patch overwrites the text anyway
 		document.execCommand('insertText', false, newText + ' ');
 
 		setTimeout(() => {
@@ -692,48 +662,42 @@
 		});
 	}
 
-	async function formatNewRequest(url, config) {
-		const originalBody = await ClaudeExtNet.readJsonRequestBody(config);
-		const completionJson = editMessage.toCompletionJSON();
-
-		const modifiedBody = {
-			...originalBody,
-			prompt: completionJson.prompt,
-			files: completionJson.files,
-			attachments: completionJson.attachments
-		};
-
-		return {
-			url,
-			config: await ClaudeExtNet.withJsonRequestBody(config, modifiedBody)
-		};
+	// The edit's send_message, rebuilt from the modal: its text, its uploaded or kept files by id, and its
+	// text attachments inline. Files removed in the modal are simply not sent.
+	function applyEdit(send) {
+		const { files_v2, attachments } = editMessage._getFilesJSON();
+		send.text = editMessage.text;
+		send.attachments = files_v2.map(file => ({
+			id: file.file_uuid,
+			file_name: file.file_name,
+			file_kind: file.file_kind === 'image' ? 'FILE_KIND_IMAGE' : 'FILE_KIND_DOCUMENT',
+		}));
+		send.inline_attachments = attachments.map(attachment => ({
+			file_name: attachment.file_name,
+			file_size: String(attachment.file_size ?? attachment.extracted_content?.length ?? 0),
+			file_type: attachment.file_type || 'text/plain',
+			extracted_content: attachment.extracted_content ?? '',
+		}));
 	}
 	//#endregion
 
-	//#region Fetch Patching
-	const originalFetch = window.fetch;
-	window.fetch = async (...args) => {
-		const [input, config] = args;
-		const url = ClaudeExtNet.getFetchUrl(input);
-
-		// Intercept /completion requests when edit data is pending
-		if (pendingEditData && ClaudeExtNet.isCompletionUrl(url) && ClaudeExtNet.getFetchMethod(input, config) === 'POST') {
-			log('Intercepting edit completion request');
-			pendingEditData = null;
-
-			try {
-				const modifiedRequest = await formatNewRequest(url, config);
-				cleanupEditState();
-				return originalFetch(modifiedRequest.url, modifiedRequest.config);
-			} catch (error) {
-				log.error('Error applying edit modifications:', error);
-				cleanupEditState();
-				return originalFetch(...args);
-			}
+	//#region Send rewriting
+	// claude.ai's own edit (submitted by autoSubmitEditWithText) goes out as a PerformAction
+	// send_message, which the interceptor host hands to this patch before it leaves.
+	QolBardHost.onSend(function advancedEdit(send) {
+		if (!pendingEditData || !editMessage) return false;
+		pendingEditData = null;
+		try {
+			applyEdit(send);
+			log('Applied the advanced edit to the send');
+			return true;
+		} catch (error) {
+			log.error('Error applying edit modifications, sent as is:', error);
+			return false;
+		} finally {
+			cleanupEditState();
 		}
-
-		return originalFetch(...args);
-	};
+	}, { label: 'advanced-edit' });
 	//#endregion
 
 	MessageButtonBar.register({

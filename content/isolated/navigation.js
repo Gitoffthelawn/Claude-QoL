@@ -93,8 +93,6 @@
 	// #endregion
 	//#region TREE VIEW
 	async function buildBookmarkTree(conversationId, conversation) {
-		const ROOT_UUID = "00000000-0000-4000-8000-000000000000";
-
 		// Build message map
 		const messages = await conversation.getMessages(true);
 		const messageMap = new Map();
@@ -108,15 +106,15 @@
 
 		// Build tree structure
 		const tree = new Map();
-		tree.set(ROOT_UUID, []);
+		tree.set(ROOT_MESSAGE_UUID, []);
 
 		// For each bookmark, find its parent bookmark
 		for (const [name, bookmarkUuid] of Object.entries(bookmarks)) {
-			let parentBookmarkUuid = ROOT_UUID;
+			let parentBookmarkUuid = ROOT_MESSAGE_UUID;
 			let tempId = messageMap.get(bookmarkUuid)?.parent_message_uuid;
 
 			// Walk up until we find another bookmark or hit root
-			while (tempId && tempId !== ROOT_UUID) {
+			while (tempId && tempId !== ROOT_MESSAGE_UUID) {
 				if (bookmarkUuids.includes(tempId)) {
 					parentBookmarkUuid = tempId;
 					break;
@@ -140,7 +138,7 @@
 		for (const bookmarkUuid of Object.values(bookmarks)) {
 			let depth = 0;
 			let tempId = bookmarkUuid;
-			while (tempId && tempId !== ROOT_UUID) {
+			while (tempId && tempId !== ROOT_MESSAGE_UUID) {
 				depth++;
 				const msg = messageMap.get(tempId);
 				tempId = msg?.parent_message_uuid;
@@ -151,7 +149,7 @@
 		return { tree, bookmarks, bookmarkDepths };
 	}
 
-	function renderBookmarkTree(tree, parentUuid, conversation, bookmarkDepths, conversationId, onDelete) {
+	function renderBookmarkTree(tree, parentUuid, goTo, bookmarkDepths, conversationId, onDelete) {
 		const children = tree.get(parentUuid) || [];
 		if (children.length === 0) return null;
 
@@ -191,21 +189,7 @@
 			content.appendChild(nameSpan);
 
 			// Click handler for navigation
-			content.onclick = async () => {
-				const loadingModal = createLoadingModal(localize('nav.navigating_to_bookmark'));
-				try {
-					loadingModal.show();
-
-					const longestLeaf = conversation.findLongestLeaf(bookmark.uuid);
-					await conversation.setCurrentLeaf(longestLeaf.leafId);
-					sessionStorage.setItem('message_uuid_to_find', bookmark.uuid);
-					window.location.reload();
-				} catch (error) {
-					log.error('Navigation failed:', error);
-					showClaudeAlert(localize('nav.navigation_error_title'), localize('nav.navigation_failed'));
-					loadingModal.destroy();
-				}
-			};
+			content.onclick = () => goTo(localize('nav.navigating_to_bookmark'), bookmark.uuid);
 
 			item.appendChild(content);
 
@@ -226,7 +210,7 @@
 			bookmarkWrapper.appendChild(item);
 
 			// Recursively render children
-			const childTree = renderBookmarkTree(tree, bookmark.uuid, conversation, bookmarkDepths, conversationId, onDelete);
+			const childTree = renderBookmarkTree(tree, bookmark.uuid, goTo, bookmarkDepths, conversationId, onDelete);
 			if (childTree) {
 				bookmarkWrapper.appendChild(childTree);
 			}
@@ -258,47 +242,9 @@
 		const conversationId = getConversationId();
 		const contentDiv = document.createElement('div');
 
-		// Top buttons row
-		const topButtonsRow = document.createElement('div');
-		topButtonsRow.className = CLAUDE_CLASSES.FLEX_GAP_2 + ' mb-4';
+		const goTo = (loadingText, uuid) => jumpToMessage(conversation, uuid, loadingText);
 
-		const latestBtn = createClaudeButton(localize('common.go_to_latest'), 'secondary', async () => {
-			const loadingModal = createLoadingModal(localize('nav.navigating_to_latest'));
-			loadingModal.show();
-
-			let latestMessage = null;
-			let latestTimestamp = 0;
-
-			const messages = await conversation.getMessages(true);
-			for (const msg of messages) {
-				const timestamp = new Date(msg.created_at).getTime();
-				if (timestamp > latestTimestamp) {
-					latestTimestamp = timestamp;
-					latestMessage = msg;
-				}
-			}
-
-			if (latestMessage) {
-				await conversation.setCurrentLeaf(latestMessage.uuid);
-				window.location.reload();
-			}
-		});
-
-		const longestBtn = createClaudeButton(localize('common.go_to_longest'), 'secondary', async () => {
-			const loadingModal = createLoadingModal(localize('nav.navigating_to_longest'));
-			loadingModal.show();
-
-			const rootId = "00000000-0000-4000-8000-000000000000";
-			const longestLeaf = conversation.findLongestLeaf(rootId);
-			await conversation.setCurrentLeaf(longestLeaf.leafId);
-			window.location.reload();
-		});
-		latestBtn.classList.add('w-full');
-		longestBtn.classList.add('w-full');
-
-		topButtonsRow.appendChild(latestBtn);
-		topButtonsRow.appendChild(longestBtn);
-		contentDiv.appendChild(topButtonsRow);
+		contentDiv.appendChild(createLatestLongestRow(conversation));
 
 		// Tree view container
 		const treeContainer = document.createElement('div');
@@ -341,8 +287,7 @@
 			treeContainer.appendChild(rootNode);
 
 			// Render tree starting from root
-			const ROOT_UUID = "00000000-0000-4000-8000-000000000000";
-			const treeContent = renderBookmarkTree(tree, ROOT_UUID, conversation, bookmarkDepths, conversationId, renderTree);
+			const treeContent = renderBookmarkTree(tree, ROOT_MESSAGE_UUID, goTo, bookmarkDepths, conversationId, renderTree);
 
 			if (treeContent) {
 				treeContainer.appendChild(treeContent);
@@ -448,18 +393,18 @@
 			return;
 		}
 
+		const clickedUuid = resolveUserMessageUuid(messageElement);
+		if (!clickedUuid) return;
+
 		let conversation = await getCachedConversation();
 		let messages = await conversation.getRenderedMessages();
-		let clickedUuid = resolveUserMessageUuid(messageElement, messages);
 
 		// A cached branch goes stale as soon as new messages are sent — if the clicked
 		// message isn't in it, rebuild once and retry.
-		if (!clickedUuid) {
+		if (!messages.some(msg => msg.uuid === clickedUuid)) {
 			conversation = await getCachedConversation(true);
 			messages = await conversation.getRenderedMessages();
-			clickedUuid = resolveUserMessageUuid(messageElement, messages);
 		}
-		if (!clickedUuid) return;
 
 		let cursor = messages.findIndex(msg => msg.uuid === clickedUuid);
 		if (cursor === -1) return;
@@ -544,8 +489,7 @@
 			e.preventDefault();
 			e.stopPropagation();
 
-			const messageContainer = e.target.closest('[data-message-uuid]');
-			const messageUuid = messageContainer?.dataset.messageUuid;
+			const messageUuid = await messageUuidOfElement(e.target);
 
 			if (!messageUuid) {
 				showClaudeAlert(localize('common.error'), localize('nav.message_uuid_not_found'));
@@ -621,8 +565,181 @@
 		document.head.appendChild(style);
 	}
 
+	//#region EARLIER VERSIONS
+	// Two ways to be on a version that isn't the chat's current one, one banner for both:
+	// - claude.ai's own version arrows (client-only): it shows "You're viewing an earlier version" with
+	//   Send disabled, and ours goes above it;
+	// - a QoL jump (jumpToMessage; jump-view.js marks <html data-qol-jump-view="<conversation id>"> for
+	//   that page load, kept when the user leaves and comes back, since the page then restores the
+	//   jumped branch from its cache; we mirror it to data-qol-jump-active while that chat is open): the
+	//   page thinks it's on the current version, so ours stands alone above the composer, claude.ai's is
+	//   hidden (a hand flip back to the real latest would show it), and sending is blocked here (the
+	//   input would send to the real leaf; jump-view.js also refuses the request itself).
+	// The banner offers to continue the version on screen: normal chats move the current leaf to it and
+	// reload; upgraded (workspace) chats can't move their leaf (their sandbox is shared across
+	// branches), so they fork it instead. In a jump, "Back to latest" just reloads. See docs/bard-rework.md
+	// (D7 and "Jumps").
+	const EARLIER_VERSION = '[data-testid="hub-earlier-version-back"]';
+	const JUMP_ATTRIBUTE = 'data-qol-jump-view'; // watched for changes; read through qolJumpedLeaf
+	const JUMP_ACTIVE = 'data-qol-jump-active';
+	// claude.ai's banner look (its Banner classes), with our accent instead of its grey ring.
+	const BANNER_CLASS = 'flex items-center gap-xs py-md font-sans text-body font-normal px-md rounded-composer bg-surface-1 text-primary qol-version-banner';
+	const bannersSeen = new WeakSet();
+	const isJumped = () => !!qolJumpedLeaf(getConversationId());
+
+	// The leaf of the version on screen: the bottom row of the list once scrolled to the end. If it
+	// somehow has children, follow the newest one down, as claude.ai does when showing a version.
+	async function viewedLeaf(conversation) {
+		const scroller = getMessageScroller();
+		for (let i = 0; i < 3 && scroller; i++) {
+			scroller.scrollTop = scroller.scrollHeight;
+			await new Promise(r => setTimeout(r, 300));
+		}
+		const rows = [...document.querySelectorAll('[data-turn-key]')];
+		const last = rows.reduce((a, b) => (b.getBoundingClientRect().bottom > a.getBoundingClientRect().bottom ? b : a), rows[0]);
+		const tree = (await conversation.getData()).chat_messages ?? [];
+		let uuid = last && uuidForTurnKey(last.dataset.turnKey, tree);
+		if (!uuid) return null;
+		const children = Map.groupBy(tree, m => m.parent_message_uuid);
+		for (let kids = children.get(uuid); kids?.length; kids = children.get(uuid)) {
+			uuid = kids.reduce((a, b) => (b.index > a.index ? b : a)).uuid;
+		}
+		return uuid;
+	}
+
+	// The kit's buttons are h-9, too tall for a banner row.
+	function bannerButton(label, variant, onClick) {
+		const button = createClaudeButton(label, variant, onClick);
+		button.className = button.className.replace(/\bh-9\b/, 'h-7').replace(/\bpx-4\b/, 'px-3').replace(/\bpy-2\b/, 'py-0') + ' text-sm shrink-0';
+		return button;
+	}
+
+	async function continueHere(conversation) {
+		const loadingModal = createLoadingModal(localize('nav.continuing'));
+		loadingModal.show();
+		try {
+			const leaf = await viewedLeaf(conversation);
+			if (!leaf) throw new Error('could not tell which version is on screen');
+			await conversation.setCurrentLeaf(leaf); // reloads onto that version
+		} catch (error) {
+			log.error('Continue from here failed:', error);
+			loadingModal.destroy();
+			showClaudeAlert(localize('nav.navigation_error_title'), localize('nav.navigation_failed'));
+		}
+	}
+
+	// The fork modal lives in MAIN (forking.js); it opens on the version's leaf.
+	async function forkHere(conversation) {
+		const leaf = await viewedLeaf(conversation).catch(() => null);
+		if (!leaf) {
+			showClaudeAlert(localize('nav.navigation_error_title'), localize('nav.navigation_failed'));
+			return;
+		}
+		window.postMessage({ type: 'qol-fork-from', messageUuid: leaf }, window.location.origin);
+	}
+
+	async function createVersionBanner(jumped) {
+		const conversation = await getConversation();
+		const upgraded = !!(await conversation.getData()).workspace_upgraded;
+
+		const banner = document.createElement('div');
+		banner.className = BANNER_CLASS;
+		// Wraps on narrow screens: the text keeps a readable width, the buttons drop below it together.
+		Object.assign(banner.style, { marginBottom: '6px', border: '1px solid #2c84db', flexWrap: 'wrap' });
+		const text = document.createElement('div');
+		text.className = 'min-w-0';
+		text.style.flex = '1 1 220px';
+		text.textContent = localize(jumped ? 'nav.jump_view_text' : upgraded ? 'nav.continue_upgraded_text' : 'nav.continue_anyway_text');
+		banner.appendChild(text);
+
+		const buttons = document.createElement('div');
+		buttons.className = 'flex gap-2 ml-auto';
+		buttons.appendChild(upgraded
+			? bannerButton(localize('fork.fork_from_here'), 'primary', () => forkHere(conversation))
+			: bannerButton(localize('nav.continue_anyway_button'), 'primary', () => continueHere(conversation)));
+		if (jumped) buttons.appendChild(bannerButton(localize('nav.back_to_latest'), 'secondary', () => location.reload()));
+		banner.appendChild(buttons);
+		return banner;
+	}
+
+	// Next to claude.ai's banner (hand flips): inside its dock card, above it, so it goes away with it.
+	async function addFlipBanner(nativeBanner) {
+		const banner = await createVersionBanner(false);
+		if (nativeBanner.isConnected && !isJumped()) nativeBanner.before(banner);
+	}
+
+	// Alone above the composer for a jump, for as long as jump-view.js keeps the attribute.
+	let jumpBanner = null;
+	let jumpBannerPending = false;
+	async function placeJumpBanner() {
+		if (!isJumped()) {
+			jumpBanner?.remove();
+			jumpBanner = null;
+			return;
+		}
+		if (jumpBanner?.isConnected || jumpBannerPending) return;
+		const holder = document.querySelector('[data-composer-card-holder]');
+		if (!holder) return;
+		jumpBannerPending = true;
+		try {
+			jumpBanner ??= await createVersionBanner(true);
+			if (isJumped()) holder.before(jumpBanner);
+		} finally {
+			jumpBannerPending = false;
+		}
+	}
+
+	// While jumped: the input would send to the server's real leaf, and Retry / Edit would branch off
+	// the hidden one, so they're blocked here (and refused by jump-view.js should anything get past).
+	function blockSendingWhileJumped() {
+		document.addEventListener('keydown', (e) => {
+			if (!isJumped() || e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+			if (!e.target.closest?.('[data-testid="chat-input"]')) return;
+			e.preventDefault();
+			e.stopImmediatePropagation();
+		}, true);
+		document.addEventListener('click', (e) => {
+			if (!isJumped() || !e.target.closest?.('[data-testid="chat-input-send"]')) return;
+			e.preventDefault();
+			e.stopImmediatePropagation();
+		}, true);
+		const style = document.createElement('style');
+		style.textContent = `
+			html[${JUMP_ACTIVE}] [data-testid="chat-input-send"] { opacity: 0.4; pointer-events: none; }
+			html[${JUMP_ACTIVE}] :is([data-testid="user-message-retry"], [data-testid="user-message-edit"], [data-testid="action-bar-retry"], .advanced-edit-button) { display: none !important; }
+			html[${JUMP_ACTIVE}] [data-cds-dock-card]:has(${EARLIER_VERSION}) { display: none; }
+		`;
+		document.head.appendChild(style);
+	}
+
+	// Coalesced on a short timer: the observer fires constantly while a reply streams. Not an animation
+	// frame: those don't run in a hidden desktop window.
+	function watchVersionBanners() {
+		let scheduled = false;
+		const check = () => {
+			scheduled = false;
+			document.documentElement.toggleAttribute(JUMP_ACTIVE, isJumped());
+			placeJumpBanner().catch(error => log.error('Jump banner failed:', error));
+			const nativeBanner = document.querySelector(EARLIER_VERSION)?.closest('[data-cds="Banner"]');
+			if (!nativeBanner || bannersSeen.has(nativeBanner) || isJumped()) return;
+			bannersSeen.add(nativeBanner);
+			addFlipBanner(nativeBanner).catch(error => log.error('Continue banner failed:', error));
+		};
+		const schedule = () => {
+			if (scheduled) return;
+			scheduled = true;
+			setTimeout(check, 100);
+		};
+		new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
+		new MutationObserver(schedule).observe(document.documentElement, { attributes: true, attributeFilter: [JUMP_ATTRIBUTE] });
+		schedule(); // the jump (and the composer) can already be there when this loads, at document_idle
+	}
+	// #endregion
+
 	function initialize() {
 		injectTreeStyles();
+		watchVersionBanners();
+		blockSendingWhileJumped();
 		// Add navigation button to top right
 		ButtonBar.register({
 			buttonClass: 'navigation-button',

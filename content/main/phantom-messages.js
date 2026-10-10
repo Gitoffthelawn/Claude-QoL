@@ -1,440 +1,265 @@
-// phantom-messages.js
-'use strict';
+// phantom-messages.js (MAIN world, document_start, right after full-load.js)
+// Shows "phantom messages", a QoL fork's copy of the source chat's history (stored encrypted in
+// ISOLATED, databases.js), above the new chat's real messages. See docs/bard-rework.md, "Phantom messages".
+//
+// On the merged experience that means patching what StreamTimeline sends (QolBardHost):
+// - every snapshot gets the phantoms as messages with negative indexes, each with its display groups
+//   and content blocks, and the real root(s) re-parented under the last phantom;
+// - live updates and history pages only need the re-parenting (a root arriving later, or the new root
+//   an edit of the first real message creates);
+// - a send whose parent is a phantom (editing the first real message) gets parent "" (a new root),
+//   which the server accepts; with a phantom parent it fails with stale_parent.
+// Phantoms get page ids of their own (claude-api.js's phantomMessageId: a marker prefix), so a stylesheet
+// dims their rows and hides their toolbars by data-turn-key alone. No markers in the text.
+//
+// The phantoms come from ISOLATED over the bridge, so only conversations listed in
+// localStorage[claude_qol_phantom_ids] (databases.js keeps it current) wait for them.
+(function () {
+	'use strict';
 
-const phantomLog = createLogger('PhantomMessages');
 
-const PHANTOM_PREFIX = 'phantom_messages_';
-const OLD_FORK_PREFIX = 'fork_history_';
-const PHANTOM_MARKER = '====PHANTOM_MESSAGE====';
-const UUID_MARKER_PREFIX = '====UUID:';
-const UUID_MARKER_SUFFIX = '====';
-const GALLERY_BREAK_MARKER = '====GALLERY_BREAK===='; // injected by image-extractor.js between galleries
+	const log = createLogger('PhantomMessages');
 
-// ==== STORAGE FUNCTIONS ====
-// storePhantomMessages, getPhantomMessages, clearPhantomMessages are defined in claude-api.js
-// They auto-detect isolated vs MAIN world and go through ClaudeExtBridge when needed.
+	const prepared = new Map(); // conversationId -> promise of { update, lastId, ids } or null
+	// conversationId -> built phantoms a snapshot has carried to the page. Only those may be used to
+	// re-parent later roots: a parent the page never received would cut the message off.
+	const ready = new Map();
 
-// Wrap the raw accessor with localStorage migration and ClaudeMessage hydration
-const _rawGetPhantomMessages = getPhantomMessages;
+	// Synchronous, so a chat without phantoms is never held.
+	function mayHavePhantoms(conversationId) {
+		try {
+			if (JSON.parse(localStorage.getItem(PHANTOM_IDS_KEY) || '[]').includes(conversationId)) return true;
+			// Very old forks, not migrated to IndexedDB yet (claude-api.js's getPhantomMessages does that).
+			return legacyPhantomKeys(conversationId).some(key => localStorage.getItem(key));
+		} catch (e) {
+			return false;
+		}
+	}
 
-getPhantomMessages = async function (conversationId) {
-	// Check localStorage first and migrate if found
-	const oldKey = `${OLD_FORK_PREFIX}${conversationId}`;
-	const newKey = `${PHANTOM_PREFIX}${conversationId}`;
+	// ======== Building the phantoms ========
 
-	const orgId = getOrgId();
-	const conversation = new ClaudeConversation(orgId, conversationId);
+	const textOf = (item) => typeof item?.text === 'string' ? item.text : '';
 
-	const localData = localStorage.getItem(newKey) || localStorage.getItem(oldKey);
-	if (localData) {
-		phantomLog(`Migrating ${conversationId} to IndexedDB`);
-		const messagesJson = JSON.parse(localData);
-		const messages = messagesJson.map(json => new ClaudeMessage(conversation, json));
-		await storePhantomMessages(conversationId, messages);
-		localStorage.removeItem(newKey);
-		localStorage.removeItem(oldKey);
+	// A tool_result's text, whatever shape its content has.
+	function resultText(result) {
+		if (!result) return '';
+		if (typeof result.content === 'string') return result.content;
+		return (result.content ?? []).map(textOf).filter(Boolean).join('\n');
+	}
+
+	// A tool_result's images as result_images: image_gallery items (the legacy image-extractor.js, image search) and
+	// bare image items (MCP tools), the latter by url or, failing that, by file uuid in this org.
+	function resultImages(result, orgId) {
+		if (!Array.isArray(result?.content)) return [];
+		const images = [];
+		for (const item of result.content) {
+			if (item.type === 'image_gallery') {
+				for (const image of item.images ?? []) {
+					if (image.url) images.push({ url: image.url, thumbnail_url: image.thumbnail_url || image.url });
+				}
+			} else if (item.type === 'image') {
+				const url = item.url || item.preview_url || (item.file_uuid && orgId ? `/api/${orgId}/files/${item.file_uuid}/preview` : null);
+				if (url) images.push({ url, thumbnail_url: item.thumbnail_url || url });
+			}
+		}
+		return images;
+	}
+
+	// Legacy files (files_v2: ClaudeFile.toApiFormat) and text attachments as Message.attachments.
+	function attachmentsOf(json) {
+		const out = [];
+		for (const file of json.files_v2 ?? json.files ?? []) {
+			const isImage = file.file_kind === 'image';
+			const url = file.preview_url ?? file.preview_asset?.url ?? file.document_asset?.url ?? null;
+			const thumbnail = file.thumbnail_url ?? file.thumbnail_asset?.url ?? null;
+			out.push({
+				id: file.file_uuid ?? crypto.randomUUID(),
+				file_name: file.file_name ?? 'file',
+				...(isImage ? { media_type: 'image/*', file_kind: 'FILE_KIND_IMAGE' } : { file_kind: 'FILE_KIND_DOCUMENT' }),
+				...(url ? { url } : {}),
+				...(thumbnail ? { thumbnail_url: thumbnail } : {}),
+			});
+		}
+		for (const attachment of json.attachments ?? []) {
+			out.push({ id: `${json.uuid}-attachment-${out.length}`, file_name: attachment.file_name ?? 'attachment.txt' });
+		}
+		return out;
+	}
+
+	// One phantom (legacy history JSON) as a Message plus its display groups and content blocks.
+	// Text becomes inline markdown, each tool_use (with its tool_result) a timeline tool row. Thinking
+	// is left out: claude.ai doesn't show it any more.
+	function buildPhantom(json, conversationId, orgId, index, parentId, out) {
+		const id = json.uuid;
+		const isUser = json.sender === 'human';
+		const attachments = attachmentsOf(json);
+		out.messages.push({
+			id, conversation_id: conversationId,
+			role: isUser ? 'ROLE_USER' : 'ROLE_ASSISTANT',
+			index, is_complete: true,
+			created_at: json.created_at || new Date(0).toISOString(),
+			...(parentId ? { parent_message_id: parentId } : {}),
+			...(isUser ? {} : { stop_reason: 'STOP_REASON_END_TURN' }),
+			...(attachments.length ? { attachments } : {}),
+		});
+
+		const results = new Map((json.content ?? []).filter(c => c.type === 'tool_result').map(c => [c.tool_use_id, c]));
+		let groupIndex = 0;
+		const addGroup = (style, extra, blocks) => {
+			const groupId = `dgrp_qolphantom_${id}_${groupIndex}`;
+			out.display_groups.push({ id: groupId, message_id: id, style, is_complete: true, ...(groupIndex ? { index: groupIndex } : {}), ...extra });
+			blocks.forEach((fields, i) => out.content_blocks.push({ id: `cblk_qolphantom_${id}_${groupIndex}_${i}`, display_group_id: groupId, is_complete: true, ...(i ? { index: i } : {}), ...fields }));
+			groupIndex++;
+		};
+
+		const items = json.content?.length ? json.content : [{ type: 'text', text: json.text ?? '' }];
+		for (const item of items) {
+			if (item.type === 'text' && textOf(item)) {
+				addGroup('GROUP_STYLE_INLINE', {}, [{ text: item.text, text_format: { style: 'STYLE_MARKDOWN' } }]);
+			} else if (item.type === 'tool_use') {
+				const name = item.name || 'tool';
+				const input = item.input === undefined ? '' : (typeof item.input === 'string' ? item.input : JSON.stringify(item.input));
+				const result = resultText(results.get(item.id));
+				const images = resultImages(results.get(item.id), orgId);
+				addGroup('GROUP_STYLE_TIMELINE', { summary: `Used ${name}`, summary_source: 'TITLE_SOURCE_LIFECYCLE' }, [{
+					title: `Used ${name}`, icon: { builtin: { type: 'BUILTIN_ICON_TYPE_WRENCH' } }, state: 'CONTENT_BLOCK_STATE_COMPLETE',
+					tool_display_name: name, title_verb: 'Used', title_object: name, row_kind: 'TOOL_ROW_KIND_GENERIC',
+					input_summary: input.slice(0, 300), input_summary_kind: 'INPUT_SUMMARY_KIND_TEXT', input_visibility: 'INPUT_VISIBILITY_SHOWN',
+					...(result ? { text: result, text_format: { style: 'STYLE_PLAIN' } } : {}),
+					...(images.length ? { result_images: images } : {}),
+					tool_use_id: item.id || `toolu_qolphantom_${id}_${groupIndex}`,
+				}]);
+			}
+		}
+		if (!groupIndex) addGroup('GROUP_STYLE_INLINE', {}, [{ text: ' ', text_format: { style: 'STYLE_MARKDOWN' } }]);
+	}
+
+	// The phantoms as a ConversationUpdate fragment: claude-api.js's pagePhantoms chain (page ids, so
+	// they never collide with the source chat's real messages and every phantom row is recognisable by
+	// its prefix; plus the acknowledgement), with negative indexes.
+	function buildPhantoms(conversationId, orgId, phantoms) {
+		const chain = pagePhantoms(phantoms);
+		const out = { messages: [], display_groups: [], content_blocks: [] };
+		chain.forEach((json, i) => buildPhantom(json, conversationId, orgId, i - chain.length, i ? json.parent_message_uuid : null, out));
+		return { update: out, lastId: chain.at(-1).uuid };
+	}
+
+	// ======== Getting the phantoms ========
+
+	async function fileText(attachment) {
+		const response = await fetch(attachment.url);
+		if (!response.ok) throw new Error(`${attachment.file_name}: ${response.status}`);
+		return await response.text();
+	}
+
+	// A QoL fork's first message carries chatlog.txt (and summary_chunk_N.txt), enough to rebuild the
+	// phantoms when none are stored, e.g. on another device. The snapshot lists the root's attachments.
+	const chatlogRoot = (snapshot) => (snapshot.messages ?? []).find(m => m.role === 'ROLE_USER' && !m.parent_message_id && m.attachments?.some(a => a.file_name === 'chatlog.txt'));
+
+	async function reconstruct(snapshot) {
+		const root = chatlogRoot(snapshot);
+		if (!root) return null;
+		const chatlog = await fileText(root.attachments.find(a => a.file_name === 'chatlog.txt'));
+		if (!chatlog.startsWith('[CLEXP:MSG_HEADER:')) return null;
+		const summaries = await Promise.all(root.attachments
+			.filter(a => /^summary_chunk_\d+\.txt$/.test(a.file_name))
+			.sort((a, b) => parseInt(a.file_name.match(/\d+/)[0]) - parseInt(b.file_name.match(/\d+/)[0]))
+			.map(fileText));
+		const rebuilt = ClaudeConversation.fromChatlog(chatlog, summaries);
+		if (!rebuilt) return null;
+		const messages = (await rebuilt.getMessages()).map(m => m.toHistoryJSON());
+		log.warn(`no stored phantoms for ${root.conversation_id}, rebuilt ${messages.length} from chatlog.txt`);
 		return messages;
 	}
 
-	// Get from IndexedDB via accessor
-	const messagesJson = await _rawGetPhantomMessages(conversationId);
-	if (messagesJson) {
-		return messagesJson.map(json => new ClaudeMessage(conversation, json));
+	function prepare(conversationId, orgId, snapshot) {
+		if (!prepared.has(conversationId)) {
+			const pending = (async () => {
+				// Always ask the database first, even when the mirror doesn't list the chat (it may not
+				// exist yet right after an update): a rebuild from chatlog.txt is lossier than what's
+				// stored, and would be stored over it.
+				const stored = await getPhantomMessages(conversationId);
+				// undefined: the database didn't answer. Rebuilding now could store over a real record.
+				if (stored === undefined) throw new Error('the phantom database did not answer');
+				const phantoms = stored?.length ? stored : await reconstruct(snapshot);
+				if (!phantoms?.length) return null;
+				if (!stored?.length) await storePhantomMessages(conversationId, phantoms);
+				const built = buildPhantoms(conversationId, orgId, phantoms);
+				log(`${built.update.messages.length} phantom messages for ${conversationId}`);
+				return built;
+			})().catch((e) => {
+				log.error(`phantom messages for ${conversationId} failed:`, e);
+				prepared.delete(conversationId); // try again on the next snapshot
+				return null;
+			});
+			prepared.set(conversationId, pending);
+		}
+		return prepared.get(conversationId);
 	}
-	return null;
-};
 
-// ==== FETCH INTERCEPTOR ====
-(function () {
-	const net = ClaudeExtNet;
-	const originalFetch = window.fetch;
-	window.fetch = async (...args) => {
-		const [input, config] = args;
-		const url = net.getFetchUrl(input);
-		const method = net.getFetchMethod(input, config);
+	// Phantoms worth waiting for: stored ones, or a fork's chatlog.txt on the root to rebuild them from.
+	const worthWaiting = (conversationId, snapshot) => prepared.has(conversationId) || mayHavePhantoms(conversationId) || !!chatlogRoot(snapshot);
 
-		if (url.includes('skip_uuid_injection=true')) {
-			return originalFetch(...args);
+	// ======== Patches ========
+
+	function reparentRoots(update, built) {
+		let changed = false;
+		for (const message of update.messages ?? []) {
+			if (message.parent_message_id || isPhantomId(message.id)) continue;
+			message.parent_message_id = built.lastId;
+			changed = true;
 		}
+		return changed;
+	}
 
-		// Check if this is a conversation data request
-		if (url.includes('rendering_mode=messages') && method === 'GET') {
-			const { conversationId } = net.getApiIds(url);
-
-			if (conversationId) {
-				const response = await originalFetch(...args);
-				const conversationData = await response.json();
-
-				let phantomMessages = await getPhantomMessages(conversationId);
-
-				if (!phantomMessages || phantomMessages.length === 0) {
-					const firstHuman = conversationData.chat_messages?.find(m => m.sender === 'human');
-					if (firstHuman) {
-						const attachments = firstHuman.attachments || [];
-
-						const chatlogAtt = attachments.find(
-							a => a.file_name === 'chatlog.txt' &&
-								a.extracted_content?.startsWith('[CLEXP:MSG_HEADER:')
-						);
-
-						if (chatlogAtt) {
-							phantomLog.warn('No phantom messages found for conversation, attempting reconstruction from attachments');
-							const summaryTexts = attachments
-								.filter(a => a.file_name?.match(/^summary_chunk_\d+\.txt$/))
-								.sort((a, b) => {
-									const numA = parseInt(a.file_name.match(/\d+/)[0]);
-									const numB = parseInt(b.file_name.match(/\d+/)[0]);
-									return numA - numB;
-								})
-								.map(a => a.extracted_content);
-
-							const reconstructed = ClaudeConversation.fromChatlog(
-								chatlogAtt.extracted_content,
-								summaryTexts
-							);
-
-							if (reconstructed) {
-								const messages = await reconstructed.getMessages();
-								const messagesJson = messages.map(m => m.toHistoryJSON());
-								await storePhantomMessages(conversationId, messagesJson);
-								phantomMessages = messages;
-							}
-						}
-					}
-				}
-
-				if (phantomMessages && phantomMessages.length > 0) {
-					injectPhantomMessages(conversationData, phantomMessages);
-				}
-
-				injectUUIDMarkers(conversationData);
-
-				return net.jsonResponse(response, conversationData);
-			}
+	QolBardHost.onSnapshot(async function phantomMessages(update, ctx) {
+		if (!ctx.conversationId || !worthWaiting(ctx.conversationId, update)) return false;
+		const result = await ctx.within(prepare(ctx.conversationId, ctx.orgId, update));
+		if (!result) {
+			log.warn(`phantoms for ${ctx.conversationId} took too long; this snapshot goes through without them`);
+			return false;
 		}
-
-		// Check if this is a completion request
-		if (net.isCompletionUrl(url) && method === 'POST') {
-			const { conversationId } = net.getApiIds(url);
-
-			if (conversationId) {
-				const phantomMessages = await getPhantomMessages(conversationId);
-
-				if (phantomMessages && phantomMessages.length > 0) {
-					const lastPhantomUuid = phantomMessages[phantomMessages.length - 1].uuid;
-
-					let body;
-					try {
-						body = await net.readJsonRequestBody(config);
-					} catch (e) {
-						return originalFetch(...args);
-					}
-
-					if (body.parent_message_uuid === lastPhantomUuid) {
-						phantomLog('Fixing parent_message_uuid from phantom to root for completion request');
-						body.parent_message_uuid = "00000000-0000-4000-8000-000000000000";
-
-						return originalFetch(input, await net.withJsonRequestBody(config, body));
-					}
-				}
-			}
+		const built = result.value;
+		if (!built) return false;
+		const known = new Set((update.messages ?? []).map(m => m.id));
+		if (!known.has(built.lastId)) {
+			const copy = structuredClone(built.update);
+			(update.messages ??= []).push(...copy.messages);
+			(update.display_groups ??= []).push(...copy.display_groups);
+			(update.content_blocks ??= []).push(...copy.content_blocks);
 		}
+		reparentRoots(update, built);
+		ready.set(ctx.conversationId, built);
+		return true;
+	}, { label: 'phantom-messages' });
 
-		return originalFetch(...args);
+	// Only phantoms a snapshot already carried: live updates and history pages never wait (a stalled
+	// rebuild would hold every frame behind them).
+	const reparentLater = (update, ctx) => {
+		const built = ready.get(ctx.conversationId);
+		return built ? reparentRoots(update, built) : false;
 	};
+	QolBardHost.onLiveUpdate(reparentLater, { label: 'phantom-messages' });
+	QolBardHost.onHistoryPage(reparentLater, { label: 'phantom-messages' });
+
+	// Any phantom parent (in practice the last one: editing the first real message) means a new root;
+	// the server rejects a phantom parent (stale_parent).
+	QolBardHost.onSend(function phantomParent(send) {
+		if (!isPhantomId(send.parent_message_id)) return false;
+		send.parent_message_id = '';
+		log('send from a phantom: sent as a new root');
+		return true;
+	}, { label: 'phantom-messages' });
+
+	// ======== DOM ========
+
+	// Phantom rows (a phantom assistant's "<phantom parent>-hub-reply" key has the prefix too): dimmed,
+	// toolbar hidden. Added to <html>, since <head> doesn't exist yet at document_start. The prefix is
+	// claude-api.js's PHANTOM_ID_PREFIX, spelled out: that file loads after this one.
+	const phantomStyle = document.createElement('style');
+	phantomStyle.textContent = `
+		[data-turn-key^="fffffffe-"] { filter: brightness(0.7); }
+		[data-turn-key^="fffffffe-"] [role="toolbar"][data-cds="MessageActions"] { display: none !important; }
+	`;
+	document.documentElement.appendChild(phantomStyle);
 })();
-
-function reorderKeys(obj, referenceObj) {
-	const orderedObj = {};
-	// First, add keys in the order they appear in referenceObj
-	// If key is missing from obj, use the value from referenceObj
-	for (const key of Object.keys(referenceObj)) {
-		orderedObj[key] = key in obj ? obj[key] : referenceObj[key];
-	}
-	// Then add any remaining keys from obj that weren't in referenceObj
-	for (const key of Object.keys(obj)) {
-		if (!(key in orderedObj)) {
-			orderedObj[key] = obj[key];
-		}
-	}
-	return orderedObj;
-}
-
-function injectPhantomMessages(data, phantomMessages) {
-	const timestamp = new Date().toISOString();
-	const referenceMsg = data.chat_messages[0];
-
-	// Add phantom marker as a separate content item for each message
-	for (const msg of phantomMessages) {
-		if (!msg.created_at) msg.created_at = timestamp;
-		if (!msg.updated_at) msg.updated_at = timestamp;
-
-		for (const item of msg.content) {
-			if (!item.start_timestamp) item.start_timestamp = timestamp;
-			if (!item.stop_timestamp) item.stop_timestamp = timestamp;
-			if (!item.citations) item.citations = [];
-		}
-
-		msg.content.push({
-			start_timestamp: timestamp,
-			stop_timestamp: timestamp,
-			type: "text",
-			text: PHANTOM_MARKER,
-			citations: []
-		});
-	}
-
-	// If last phantom is human, add an ack message
-	let lastPhantom = phantomMessages[phantomMessages.length - 1];
-	if (lastPhantom && lastPhantom.sender === 'human') {
-		const orgId = getOrgId();
-		const conversation = new ClaudeConversation(orgId, null);
-		const ackMessage = new ClaudeMessage(conversation);
-		ackMessage.uuid = crypto.randomUUID();
-		ackMessage.parent_message_uuid = lastPhantom.uuid;
-		ackMessage.sender = 'assistant';
-		ackMessage.created_at = timestamp;
-		ackMessage.updated_at = timestamp;
-		ackMessage.content = [
-			{
-				start_timestamp: timestamp,
-				stop_timestamp: timestamp,
-				type: "text",
-				text: "Acknowledged - end of previous conversation.",
-				citations: []
-			},
-			{
-				start_timestamp: timestamp,
-				stop_timestamp: timestamp,
-				type: "text",
-				text: PHANTOM_MARKER,
-				citations: []
-			}
-		];
-		phantomMessages.push(ackMessage);
-		lastPhantom = ackMessage;
-	}
-
-	phantomLog(`Injecting ${phantomMessages.length} phantom messages into conversation`);
-
-	// Convert to JSON for injection
-	let phantomJson = phantomMessages.map(msg => msg.toHistoryJSON());
-
-	// Reorder keys to match reference message format
-	if (referenceMsg) {
-		phantomJson = phantomJson.map(msg => reorderKeys(msg, referenceMsg));
-	}
-
-	// Rewire roots onto the last phantom, prepend, reindex. Shared with
-	// ClaudeConversation.getRenderedMessages so both views of the list agree.
-	stitchPhantomMessages(data, phantomJson);
-
-	phantomLog('Chat messages after injecting phantoms:', data.chat_messages.length);
-}
-
-function injectUUIDMarkers(data) {
-	const assistantMessages = data.chat_messages.filter(msg => msg.sender !== 'human');
-
-	assistantMessages.forEach(msg => {
-		const uuidMarker = UUID_MARKER_PREFIX + msg.uuid + UUID_MARKER_SUFFIX;
-		msg.content.push({
-			type: "text",
-			text: uuidMarker
-		});
-	});
-}
-
-
-// Style phantom messages in the DOM
-function stylePhantomMessages() {
-	const { allMessages } = getUIMessages();
-
-	allMessages.forEach(container => {
-		const textContent = container.textContent || '';
-		const hasMarker = textContent.includes(PHANTOM_MARKER);
-		const isMarkedPhantom = container.hasAttribute('data-phantom-styled');
-
-		if (hasMarker) {
-			container.setAttribute('data-phantom-styled', 'true');
-			removePhantomMarkerFromElement(container);
-		}
-
-		if (hasMarker || isMarkedPhantom) {
-			// The grandparent (a user message's bubble), or the first element above it that renders a
-			// box: a filter on a display:contents wrapper (assistant messages) has no effect.
-			let dimTarget = container.parentElement?.parentElement;
-			while (dimTarget && getComputedStyle(dimTarget).display === 'contents') {
-				dimTarget = dimTarget.parentElement;
-			}
-			if (dimTarget) dimTarget.style.filter = 'brightness(0.70)';
-
-			const controls = findMessageControls(container);
-			if (controls) {
-				controls.style.display = 'none';
-			}
-		}
-	});
-}
-
-function removePhantomMarkerFromElement(element) {
-	// Markers are now separate content items rendered as their own <p> elements.
-	// Just hide them — no textContent modification needed, avoids React DOM desync.
-	const paragraphs = element.querySelectorAll('p');
-	paragraphs.forEach(p => {
-		if (p.textContent.includes(PHANTOM_MARKER)) {
-			p.style.display = 'none';
-		}
-	});
-}
-
-// Add new function to extract and store UUIDs
-function extractAndStoreUUIDs() {
-	const { allMessages } = getUIMessages();
-	allMessages.forEach(container => {
-		const textContent = container.textContent || '';
-
-		// Look for UUID marker using lastIndexOf
-		const markerStart = textContent.lastIndexOf(UUID_MARKER_PREFIX);
-		if (markerStart !== -1) {
-			const uuidStart = markerStart + UUID_MARKER_PREFIX.length;
-			const uuidEnd = textContent.indexOf(UUID_MARKER_SUFFIX, uuidStart);
-
-			if (uuidEnd !== -1) {
-				const uuid = textContent.substring(uuidStart, uuidEnd);
-
-				// Put UUID on parent container instead of the message element itself
-				const parentContainer = container?.parentElement?.parentElement?.parentElement;
-				if (parentContainer) {
-					parentContainer.setAttribute('data-message-uuid', uuid);
-				}
-
-				// Remove the marker from DOM
-				removeUUIDMarkerFromElement(container);
-			}
-		}
-	});
-}
-
-function removeUUIDMarkerFromElement(element) {
-	// Markers are now separate content items rendered as their own <p> elements.
-	// Just hide them — no textContent modification needed, avoids React DOM desync.
-	const paragraphs = element.querySelectorAll('p');
-	paragraphs.forEach(p => {
-		if (p.textContent.includes(UUID_MARKER_PREFIX)) {
-			p.style.display = 'none';
-		}
-	});
-}
-
-// Gallery-break markers sit between injected image galleries (image-extractor.js). Unlike the
-// UUID marker they also appear mid-stream, so they're hidden on every pass, not just once a
-// message has been tagged.
-function hideGalleryBreakMarkers() {
-	const { allMessages } = getUIMessages();
-	allMessages.forEach(container => {
-		if (!container.textContent.includes(GALLERY_BREAK_MARKER)) return;
-		container.querySelectorAll('p').forEach(p => {
-			if (p.textContent.includes(GALLERY_BREAK_MARKER)) {
-				p.style.display = 'none';
-			}
-		});
-	});
-}
-
-
-// ==== CLIPBOARD CLEANUP - Strip markers before copying ====
-const originalClipboardWrite = navigator.clipboard.write;
-navigator.clipboard.write = async (data) => {
-	try {
-		const item = data[0];
-		if (!item) return originalClipboardWrite.call(navigator.clipboard, data);
-
-		const types = {};
-
-		for (const type of item.types) {
-			const blob = await item.getType(type);
-
-			if (type === 'text/plain' || type === 'text/html') {
-				let text = await blob.text();
-
-				// Strip phantom markers
-				text = text.replace(/====PHANTOM_MESSAGE====/g, '');
-
-				// Strip UUID markers
-				text = text.replace(/====UUID:[a-f0-9-]+====/gi, '');
-
-				// Strip gallery-break markers
-				text = text.replace(/====GALLERY_BREAK====/g, '');
-
-				// Clean up extra newlines/whitespace from removal
-				if (type === 'text/plain') {
-					text = text.replace(/\n{3,}/g, '\n\n').trim();
-				} else {
-					// For HTML, clean up empty paragraphs that might result
-					text = text.replace(/<p[^>]*>\s*<\/p>/gi, '');
-				}
-
-				types[type] = new Blob([text], { type });
-			} else {
-				// Preserve other types as-is
-				types[type] = blob;
-			}
-		}
-
-		return originalClipboardWrite.call(navigator.clipboard, [new ClipboardItem(types)]);
-	} catch (error) {
-		phantomLog.error('Error cleaning clipboard text:', error);
-		return originalClipboardWrite.call(navigator.clipboard, data);
-	}
-};
-
-// The message list is virtualized, so rows mount continuously while scrolling and
-// each one arrives with its raw ====UUID:...==== marker visible. A poll can only
-// hide it a tick later, which shows up as flashing text on every scroll; observer
-// callbacks are delivered before paint, so they hide it in the same frame.
-//
-// The observer is a latency optimisation only. The interval below stays as the
-// supervisor and reattaches it after SPA navigation replaces the container, so a
-// dead observer degrades to the old polling behaviour rather than to broken.
-let _observedContainer = null;
-let _messageObserver = null;
-let _passScheduled = false;
-
-function runTaggingPass() {
-	stylePhantomMessages();
-	extractAndStoreUUIDs();
-	hideGalleryBreakMarkers();
-}
-
-function schedulePass() {
-	if (_passScheduled) return;
-	_passScheduled = true;
-	requestAnimationFrame(() => {
-		_passScheduled = false;
-		runTaggingPass();
-	});
-}
-
-function syncMessageObserver() {
-	// Scoped to the conversation scroll container (message-ui.js) rather than
-	// document.body, so streaming text elsewhere on the page can't churn it.
-	const container = getMessageScroller();
-	if (!container || container === _observedContainer) {
-		if (_observedContainer && !_observedContainer.isConnected) {
-			_messageObserver?.disconnect();
-			_observedContainer = null;
-		}
-		return;
-	}
-
-	_messageObserver?.disconnect();
-	_messageObserver = new MutationObserver(schedulePass);
-	_messageObserver.observe(container, { childList: true, subtree: true });
-	_observedContainer = container;
-	runTaggingPass();
-}
-
-setInterval(() => {
-	syncMessageObserver();
-	runTaggingPass();
-}, 300);

@@ -35,6 +35,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['id'] ??= {}, {
 	"nav.message_uuid_not_found": "Tidak dapat menemukan UUID pesan",
 	"nav.success_title": "Berhasil",
 	"nav.bookmark_added": "Penanda ditambahkan!",
+	"nav.continue_anyway_text": "QoL: Anda juga bisa melanjutkan versi ini di sini.",
+	"nav.continue_anyway_button": "Lanjutkan dari sini",
+	"nav.continuing": "Beralih ke versi ini...",
+	"nav.continue_upgraded_text": "QoL: obrolan ini tidak dapat melanjutkan versi sebelumnya di tempat, karena berkasnya dibagikan di semua versi. Anda bisa mem-fork-nya sebagai gantinya.",
+	"nav.jump_view_text": "QoL: Anda sedang melihat versi sebelumnya dari obrolan ini. Pengiriman dijeda di sini.",
+	"nav.back_to_latest": "Kembali ke terbaru",
 
 	// search
 	"search.branched_messages_ago": "Bercabang {n} pesan yang lalu",
@@ -195,7 +201,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['id'] ??= {}, {
 	"tts.model_label": "Model",
 	"tts.custom_model_hint": "Nama model untuk endpoint kustom",
 	"tts.auto_speak": "Bacakan otomatis pesan baru",
-	"tts.auto_speak_note": "Hanya berfungsi di chat biasa (bukan Cowork, bukan Code)",
+	"tts.auto_speak_note": "Hanya berfungsi di chat biasa (bukan Code)",
 	"tts.per_chat_heading": "Pengaturan Per Chat",
 	"tts.quotes_only": "Hanya bacakan teks dalam tanda kutip",
 	"tts.quotes_only_tooltip": "Pemutaran cepat khusus dialog menggunakan regex (instan, tanpa panggilan API)",
@@ -282,6 +288,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['id'] ??= {}, {
 	"fork.creating": "Membuat percakapan fork...",
 	"fork.complete_redirecting": "Fork selesai! Mengalihkan...",
 	"fork.fork_failed": "Gagal membuat fork percakapan: {error}",
+	"fork.upgraded_warning": "Obrolan ini berjalan di lingkungan cloud: obrolan hasil fork tidak akan menyertakan berkas apa pun yang dibuat di sana!",
 	"fork.files_not_transferred": "File berikut tidak dapat dipindahkan ke percakapan fork:",
 	"fork.file_transfer_warning": "Peringatan Pemindahan File",
 	"fork.upload_failed_title": "Gagal Mengunggah File",
@@ -326,8 +333,6 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['id'] ??= {}, {
 	// images
 	"images.generated_image": "Gambar yang dihasilkan",
 	"images.generated_images": "Gambar yang dihasilkan",
-	"images.generated_for": "Gambar yang dihasilkan untuk: {prompt}",
-	"images.generated_title": "Dihasilkan: {prompt}",
 
 	// models
 	"models.opus_notice": "Opus menghabiskan batas penggunaan lebih cepat daripada model lain",
@@ -355,4 +360,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['id'] ??= {}, {
 
 	// main
 	"main.rich_copy_no_text": "Tidak ada konten teks",
+
+	// account
+	"account.legacy_title": "Akun Anda belum menggunakan claude.ai yang baru",
+	"account.legacy_body": "Versi Claude QoL ini memerlukan tampilan baru claude.ai, yang belum tersedia untuk akun Anda. Fitur obrolannya tidak akan berfungsi sampai saat itu.",
+
+	// settings
+	"settings.full_load": "Muat seluruh percakapan",
+	"settings.full_load_hint": "Memuat semua pesan saat obrolan dibuka, agar Ctrl+F, pencarian obrolan, dan penanda dapat menjangkau pesan lama. Matikan jika obrolan panjang terasa lambat.",
 });

@@ -35,6 +35,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ko'] ??= {}, {
 	"nav.message_uuid_not_found": "메시지 UUID를 찾을 수 없습니다",
 	"nav.success_title": "완료",
 	"nav.bookmark_added": "북마크가 추가되었습니다!",
+	"nav.continue_anyway_text": "QoL: 이 버전을 여기에서 이어갈 수도 있습니다.",
+	"nav.continue_anyway_button": "여기서 계속하기",
+	"nav.continuing": "이 버전으로 전환하는 중...",
+	"nav.continue_upgraded_text": "QoL: 이 채팅은 파일이 모든 버전에서 공유되므로 이전 버전을 그 자리에서 이어갈 수 없습니다. 대신 포크할 수 있습니다.",
+	"nav.jump_view_text": "QoL: 이 채팅의 이전 버전을 보고 있습니다. 여기서는 전송이 일시 중지됩니다.",
+	"nav.back_to_latest": "최신으로 돌아가기",
 
 	// search
 	"search.branched_messages_ago": "{n}개 메시지 전에 분기됨",
@@ -195,7 +201,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ko'] ??= {}, {
 	"tts.model_label": "모델",
 	"tts.custom_model_hint": "사용자 지정 엔드포인트의 모델 이름",
 	"tts.auto_speak": "새 메시지 자동 읽기",
-	"tts.auto_speak_note": "일반 채팅에서만 작동합니다(Cowork, Code 제외)",
+	"tts.auto_speak_note": "일반 채팅에서만 작동합니다(Code 제외)",
 	"tts.per_chat_heading": "채팅별 설정",
 	"tts.quotes_only": "따옴표 안의 텍스트만 읽기",
 	"tts.quotes_only_tooltip": "정규식을 이용한 빠른 대사 전용 재생(즉시, API 호출 없음)",
@@ -282,6 +288,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ko'] ??= {}, {
 	"fork.creating": "포크된 대화 생성 중...",
 	"fork.complete_redirecting": "포크 완료! 이동 중...",
 	"fork.fork_failed": "대화를 포크하지 못했습니다: {error}",
+	"fork.upgraded_warning": "이 채팅은 클라우드 환경에서 실행됩니다. 포크한 채팅에는 그곳에서 만든 파일이 포함되지 않습니다!",
 	"fork.files_not_transferred": "다음 파일을 포크된 대화로 옮기지 못했습니다:",
 	"fork.file_transfer_warning": "파일 전송 경고",
 	"fork.upload_failed_title": "파일 업로드 실패",
@@ -326,8 +333,6 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ko'] ??= {}, {
 	// images
 	"images.generated_image": "생성된 이미지",
 	"images.generated_images": "생성된 이미지",
-	"images.generated_for": "생성된 이미지: {prompt}",
-	"images.generated_title": "생성됨: {prompt}",
 
 	// models
 	"models.opus_notice": "Opus는 다른 모델보다 사용 한도를 더 빨리 소모합니다",
@@ -355,4 +360,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['ko'] ??= {}, {
 
 	// main
 	"main.rich_copy_no_text": "텍스트 콘텐츠를 찾을 수 없습니다",
+
+	// account
+	"account.legacy_title": "계정이 아직 새로운 claude.ai로 전환되지 않았습니다",
+	"account.legacy_body": "이 버전의 Claude QoL은 claude.ai의 새로운 환경이 필요하지만, 아직 계정에 적용되지 않았습니다. 그때까지 채팅 기능은 작동하지 않습니다.",
+
+	// settings
+	"settings.full_load": "전체 대화 불러오기",
+	"settings.full_load_hint": "채팅을 열 때 모든 메시지를 불러와 Ctrl+F, 채팅 검색, 북마크가 오래된 메시지에도 닿을 수 있게 합니다. 긴 채팅이 느리게 느껴지면 끄세요.",
 });

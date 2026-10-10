@@ -153,8 +153,23 @@
 			abortSynth(d.requestId);
 		} else if (d?.type === 'TTS_HIJACK_CONFIG_REQUEST') {
 			pushHijackConfig();
+		} else if (d?.type === 'TTS_OPUS_WASM_REQUEST') {
+			sendOpusWasm();
 		}
 	});
+
+	// The Opus encoder's .wasm for tts-ws-interceptor.js (MAIN), which claude.ai's CSP keeps from
+	// fetching extension files itself. A public library, so answering any page script is harmless.
+	async function sendOpusWasm() {
+		try {
+			const response = await fetch(chrome.runtime.getURL('lib/opus/opus-encoder.wasm'));
+			const bytes = await response.arrayBuffer();
+			window.postMessage({ type: 'TTS_OPUS_WASM', bytes }, window.location.origin, [bytes]);
+		} catch (error) {
+			log.error('Could not load the Opus encoder:', error);
+			window.postMessage({ type: 'TTS_OPUS_WASM', error: String(error) }, window.location.origin);
+		}
+	}
 
 	async function autoSpeak(messageUuid) {
 		const settings = await loadSettings();
@@ -163,8 +178,18 @@
 		// Retry logic to find the native button (DOM might not be ready yet).
 		const maxRetries = 10;
 		const retryDelay = 300;
+		// The reply's own row: a just-streamed original reply is keyed "<parent>-hub-reply"
+		// (message-ui.js), so it's found through the tree, fetched fresh so it includes the reply. The
+		// loop waits for that exact row; never guess "the last reply", which can still be the previous
+		// one while the new row mounts.
+		let findRow = null;
 		for (let attempt = 0; attempt < maxRetries; attempt++) {
-			const messageElement = document.querySelector(`[data-message-uuid="${CSS.escape(String(messageUuid))}"]`);
+			let messageElement = document.querySelector(`[data-turn-key="${CSS.escape(String(messageUuid))}"]`);
+			if (!messageElement) {
+				findRow ??= rowFinder(String(messageUuid), await new ClaudeConversation(getOrgId(), getConversationId()).getData(true)
+					.then(data => data.chat_messages ?? [], () => []));
+				messageElement = findRow();
+			}
 			if (messageElement) {
 				const nativeBtn = messageElement.querySelector('button[data-testid="action-bar-read-aloud"]');
 				if (nativeBtn) {
@@ -179,7 +204,7 @@
 		log('Could not find native read-aloud button for message:', messageUuid);
 	}
 
-	// Sent by tts-interceptor.js when a completion stream ends. Not awaited: the button search can
+	// Sent by tts-interceptor.js when a reply finishes streaming (the turn settles on StreamTimeline). Not awaited: the button search can
 	// outlast the bridge's timeout, and MAIN ignores the reply anyway.
 	ClaudeExtBridge.serve('qol', {
 		handlers: {
@@ -1006,7 +1031,7 @@
 			createFn: createSettingsButton,
 			tooltip: localize('tts.settings_title'),
 			forceDisplayOnMobile: false, // on phones: in the More-actions menu (the preset switcher stays out)
-			pages: ['chat', 'home', 'coworkHome', 'coworkChat'],
+			pages: ['chat', 'home'],
 		});
 		pushHijackConfig();
 		// Re-push the hijack decision + recolor the icon whenever a relevant setting changes.

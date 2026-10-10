@@ -35,6 +35,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['it'] ??= {}, {
 	"nav.message_uuid_not_found": "Impossibile trovare l'UUID del messaggio",
 	"nav.success_title": "Operazione riuscita",
 	"nav.bookmark_added": "Segnalibro aggiunto!",
+	"nav.continue_anyway_text": "QoL: puoi anche continuare questa versione qui.",
+	"nav.continue_anyway_button": "Continua da qui",
+	"nav.continuing": "Passaggio a questa versione...",
+	"nav.continue_upgraded_text": "QoL: questa chat non può continuare una versione precedente sul posto, perché i suoi file sono condivisi tra le versioni. Puoi crearne un fork invece.",
+	"nav.jump_view_text": "QoL: stai guardando una versione precedente di questa chat. L'invio è in pausa qui.",
+	"nav.back_to_latest": "Torna all'ultima",
 
 	// search
 	"search.branched_messages_ago": "Ramificato {n} messaggi fa",
@@ -195,7 +201,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['it'] ??= {}, {
 	"tts.model_label": "Modello",
 	"tts.custom_model_hint": "Nome del modello per l'endpoint personalizzato",
 	"tts.auto_speak": "Lettura automatica dei nuovi messaggi",
-	"tts.auto_speak_note": "Funziona solo nelle chat normali (non in Cowork né in Code)",
+	"tts.auto_speak_note": "Funziona solo nelle chat normali (non in Code)",
 	"tts.per_chat_heading": "Impostazioni per chat",
 	"tts.quotes_only": "Leggi solo il testo tra virgolette",
 	"tts.quotes_only_tooltip": "Riproduzione rapida dei soli dialoghi tramite regex (immediata, senza chiamate API)",
@@ -282,6 +288,7 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['it'] ??= {}, {
 	"fork.creating": "Creazione della conversazione fork...",
 	"fork.complete_redirecting": "Fork completato! Reindirizzamento...",
 	"fork.fork_failed": "Impossibile creare il fork della conversazione: {error}",
+	"fork.upgraded_warning": "Questa chat gira in un ambiente cloud: la chat biforcata non includerà nessuno dei file creati lì!",
 	"fork.files_not_transferred": "Non è stato possibile trasferire i seguenti file nella conversazione fork:",
 	"fork.file_transfer_warning": "Avviso di trasferimento file",
 	"fork.upload_failed_title": "Caricamento del file non riuscito",
@@ -326,8 +333,6 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['it'] ??= {}, {
 	// images
 	"images.generated_image": "Immagine generata",
 	"images.generated_images": "Immagini generate",
-	"images.generated_for": "Immagine generata per: {prompt}",
-	"images.generated_title": "Generata: {prompt}",
 
 	// models
 	"models.opus_notice": "Opus consuma i limiti di utilizzo più velocemente degli altri modelli",
@@ -355,4 +360,12 @@ Object.assign((globalThis.CLAUDE_EXT_I18N ??= {})['it'] ??= {}, {
 
 	// main
 	"main.rich_copy_no_text": "Nessun contenuto testuale trovato",
+
+	// account
+	"account.legacy_title": "Il tuo account non è ancora sul nuovo claude.ai",
+	"account.legacy_body": "Questa versione di Claude QoL richiede la nuova esperienza di claude.ai, che non è ancora arrivata sul tuo account. Fino ad allora le sue funzioni per le chat non funzioneranno.",
+
+	// settings
+	"settings.full_load": "Carica le conversazioni intere",
+	"settings.full_load_hint": "Carica tutti i messaggi all'apertura di una chat, così Ctrl+F, la ricerca nella chat e i segnalibri raggiungono anche i messaggi vecchi. Disattivalo se le chat lunghe sembrano lente.",
 });

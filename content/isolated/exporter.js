@@ -688,7 +688,8 @@
 					} else {
 						highlighted = hljs.highlightAuto(text).value;
 					}
-					return `<pre><code class="hljs">${highlighted}</code></pre>`;
+					const label = lang ? `<span class="code-lang">${esc(lang)}</span>` : '';
+					return `<pre>${label}<code class="hljs">${highlighted}</code></pre>`;
 				}
 			}
 		});
@@ -732,7 +733,8 @@
 		// Render ALL messages as hidden divs
 		let messagesHtml = `<div class="export-meta"><h1>${esc(title)}</h1>`;
 		if (conversationData.model) {
-			messagesHtml += `<div class="export-model">Model: ${esc(conversationData.model)}</div>`;
+			const modelName = CLAUDE_MODELS.find(m => m.value === conversationData.model)?.label || conversationData.model;
+			messagesHtml += `<div class="export-model">${esc(modelName)}</div>`;
 		}
 		messagesHtml += `</div>\n`;
 		for (const message of messages) {
@@ -790,17 +792,22 @@
 				// Already shown inline by the tool-result path above — don't embed it twice
 				// (and don't pay for the download again).
 				if (file.file_uuid && renderedImageUuids.has(file.file_uuid)) continue;
+				// The file's name as a pill: a download link with its data, or plain without.
+				const name = esc(file.file_name);
+				const pill = (href) => (href
+					? `<a class="file-pill" href="${href}" download="${name}">${name}</a>`
+					: `<span class="file-pill">${name}</span>`);
 				if (file instanceof ClaudeAttachment) {
 					const b64 = btoa(unescape(encodeURIComponent(file.extracted_content || '')));
 					const mimeType = mime.getType(file.file_name) || 'text/plain';
-					fileResults.push(`<a class="file-pill" href="data:${mimeType};base64,${b64}" download="${esc(file.file_name)}">File: ${esc(file.file_name)}</a>`);
+					fileResults.push(pill(`data:${mimeType};base64,${b64}`));
 					continue;
 				}
 
 				// Images dominate an export's size and download time. With them off, keep the record
 				// of what was attached without paying for the bytes — or for the pacing delay.
 				if (!includeImages && file.file_kind === 'image') {
-					fileResults.push(`<span class="file-pill">File: ${esc(file.file_name)}</span>`);
+					fileResults.push(pill());
 					continue;
 				}
 
@@ -808,25 +815,27 @@
 					await paceDownload();
 					const blob = await file.download();
 					if (!blob) {
-						fileResults.push(`<span class="file-pill">File: ${esc(file.file_name)}</span>`);
+						fileResults.push(pill());
 						continue;
 					}
 
 					const dataUri = await blobToDataUri(blob);
 
 					if (file.file_kind === 'image') {
-						fileResults.push(`<img src="${dataUri}" alt="${esc(file.file_name)}">`);
+						fileResults.push(`<img src="${dataUri}" alt="${name}">`);
 					} else {
-						fileResults.push(`<a class="file-pill" href="${dataUri}" download="${esc(file.file_name)}">File: ${esc(file.file_name)}</a>`);
+						fileResults.push(pill(dataUri));
 					}
 				} catch (e) {
-					fileResults.push(`<span class="file-pill">File: ${esc(file.file_name)}</span>`);
+					fileResults.push(pill());
 				}
 			}
 
 			contentHtml += fileResults.join('');
 			const tsAttr = message.created_at ? ` data-timestamp="${new Date(message.created_at).getTime()}"` : '';
-			messagesHtml += `<div class="msg ${roleClass}" id="msg-${message.uuid}"${tsAttr} style="display:none"><div class="msg-header">${role}</div><div class="msg-body">${contentHtml}</div></div>\n`;
+			// No visible role label, as on claude.ai (the bubble says who spoke); the footer holds the
+			// branch arrows and the hover-only timestamp, both filled in by the template script.
+			messagesHtml += `<div class="msg ${roleClass}" id="msg-${message.uuid}"${tsAttr} style="display:none"><span class="sr-only">${role}</span><div class="msg-body">${contentHtml}</div><div class="msg-footer"><span class="msg-timestamp"></span></div></div>\n`;
 		}
 
 		// Assemble from template in a SINGLE replace pass. Chained .replace() calls
@@ -1906,31 +1915,15 @@
 				}
 
 				for (const doc of docs) {
-					const filename = makeUniqueFilename(doc.file_name, doc.uuid);
+					const filename = makeUniqueFilename(ClaudeProject.docFileName(doc), doc.uuid);
 					await addToZip(masterZip, `project_files/${filename}`, doc.content);
 				}
 
 				for (const file of files) {
 					if (bulkExportCancelled) break;
 
-					let downloadUrl;
-					if (file.file_kind === 'document' && file.document_asset) {
-						downloadUrl = file.document_asset.url;
-					} else if (file.file_kind === 'image') {
-						downloadUrl = file.preview_url || file.thumbnail_url;
-						if (file.preview_asset?.file_variant === 'original') {
-							downloadUrl = file.preview_asset.url;
-						} else if (file.thumbnail_asset?.file_variant === 'original') {
-							downloadUrl = file.thumbnail_asset.url;
-						}
-					} else {
-						downloadUrl = file.preview_url || file.thumbnail_url;
-					}
-
-					if (!downloadUrl) continue;
-
 					try {
-						const response = await fetch(downloadUrl);
+						const response = await fetch(project.contentsUrl(file));
 						if (!response.ok) {
 							log.error(`Failed to fetch project file ${file.file_name}`);
 							continue;
@@ -1954,16 +1947,9 @@
 			loadingModal.setContent(createLoadingContent(bulkExportCancelled ? localize('export.generating_partial_zip') : localize('export.generating_zip')));
 			const masterBlob = await masterZip.generateAsync({ type: 'blob' });
 
-			const url = URL.createObjectURL(masterBlob);
-			const link = document.createElement('a');
-			link.href = url;
-			if (projectId) {
-				link.download = `Claude_project_export_${projectName}_${projectId}.zip`;
-			} else {
-				link.download = `Claude_bulk_export_${new Date().toISOString().slice(0, 10)}.zip`;
-			}
-			link.click();
-			URL.revokeObjectURL(url);
+			saveBlob(masterBlob, projectId
+				? `Claude_project_export_${projectName}_${projectId}.zip`
+				: `Claude_bulk_export_${new Date().toISOString().slice(0, 10)}.zip`);
 
 			loadingModal.destroy();
 			modal.hide();
@@ -2153,12 +2139,7 @@
 							orgId, conversationId, format, extension, exportTree, exportOptions, loadingModal
 						);
 
-						const url = URL.createObjectURL(blob);
-						const link = document.createElement('a');
-						link.href = url;
-						link.download = filename;
-						link.click();
-						URL.revokeObjectURL(url);
+						saveBlob(blob, filename);
 
 						loadingModal.destroy();
 						modal.hide();
