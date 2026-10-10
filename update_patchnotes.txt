@@ -1,4 +1,4 @@
-TODO: Support the merged cowork/chat experience. The API has changed, so I need it on my account before I can do this.
-Added support for all claude.ai UI languages.
+Support for claude.ai's new merged chat experience.
+Jumping to bookmarks and search results no longer moves the chat.
+New: Claude Code system prompt presets.
 A lot of bugfixes.
-Mostly a refactor of a lot of code, so it's shared between this extension and the Usage Tracker.
