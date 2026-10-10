@@ -8,32 +8,27 @@
 // Page layouts for top-right ButtonBar injection only.
 // Each layout defines where the toolbox button container is anchored in the DOM.
 // Code layouts must be checked before chat/home to avoid false matches.
+// Claude Code: /code on the web, /epitaxy in the desktop client (its /code redirects there). Both draw a
+// title bar whose end cluster (.epitaxy-titlebar-end) holds the native buttons (Changes, Files, Share on
+// a session; empty on the start page). That cluster pushes itself right with ml-auto, so we sit just after
+// it (before it we'd be left behind next to the title). Other Code pages (/code/artifacts, ...) get no
+// buttons.
+function codeTitlebarAnchor() {
+	const end = document.querySelector('.epitaxy-titlebar-end');
+	if (!end) return null;
+	return { parent: end.parentElement, referenceNode: end.nextSibling, mode: 'inline', fitToHeader: true };
+}
+
 const pageLayouts = {
 	codeHome: {
 		group: 'codeHome',
-		match() { return !!window.location.pathname.match(/\/claude-code-desktop\/draft_/); },
-		// Disabled for code web (aka claude.ai/code) for now due to being totally different.
-		getAnchor() {
-			const mainContent = document.getElementById('main-content');
-			if (!mainContent) return null;
-			return { parent: mainContent, referenceNode: null, mode: 'self-container' };
-		},
+		match() { return /^\/(code|epitaxy)\/?$/.test(location.pathname); },
+		getAnchor: codeTitlebarAnchor,
 	},
 	codeChat: {
 		group: 'codeChat',
-		match() {
-			return !!window.location.pathname.match(/\/claude-code-desktop\/session_/)
-			//|| !!window.location.pathname.match(/\/code\//);	// Disable it on web for now.
-		},
-		getAnchor() {
-			const sticky = document.querySelector('.sticky.top-0.z-20');
-			if (!sticky) return null;
-			const row = sticky.querySelector('.flex.items-center.gap-1');
-			if (!row) return null;
-			// Insert before the share/actions container (last child of the row)
-			const actionsContainer = row.lastElementChild;
-			return { parent: row, referenceNode: actionsContainer, mode: 'inline' };
-		},
+		match() { return /^\/(code|epitaxy)\/(session|local)_/.test(location.pathname); }, // cloud and desktop-local sessions
+		getAnchor: codeTitlebarAnchor,
 	},
 	chatActions: {
 		group: 'chat',
@@ -149,6 +144,7 @@ const ButtonBar = {
 		'navigation-button',
 		'preset-switcher-button',
 		'export-button',
+		'code-prompt-button',
 		'tts-settings-button',
 	],
 
@@ -393,56 +389,40 @@ const ButtonBar = {
 		// Check if existing container is still in the DOM
 		if (this._container && this._container.isConnected) {
 			// Verify it's still in the right parent
-			if (anchor.mode === 'self-container') {
-				if (this._container.parentElement === anchor.parent) return;
-			} else {
-				if (this._container.parentElement === anchor.parent) return;
-			}
+			if (this._container.parentElement === anchor.parent) return;
 			// Wrong parent — discard
 			this._container.remove();
 			this._container = null;
 		}
 
-		if (anchor.mode === 'self-container') {
-			// Desktop homepage: container is a direct child of parent with special classes
-			let container = anchor.parent.querySelector('.toolbox-buttons-home');
-			if (!container) {
-				container = document.createElement('div');
-				container.className = 'toolbox-buttons-home toolbox-buttons absolute right-3 flex items-center gap-3.5';
-				container.style.top = '0.625rem';
+		let container = anchor.parent.querySelector(':scope > .toolbox-buttons');
+		if (!container) {
+			container = document.createElement('div');
+			const isMobileChat = this._currentGroup === 'chat' && isMobileLayout();
+			if (anchor.mode === 'wiggle') {
+				if (isMobileChat) {
+					container.className = 'toolbox-buttons flex items-center gap-1 pointer-events-auto self-end px-3 z-20 bg-bg-100 rounded-bl-lg';
+					container.style.height = '2.25rem';
+					container.style.marginTop = '-4px';
+				} else {
+					container.className = 'toolbox-buttons absolute top-0 z-20 flex items-center gap-1';
+					container.style.height = '3rem';
+				}
+			} else {
+				if (isMobileChat) {
+					container.className = 'toolbox-buttons absolute top-full right-0 flex items-center gap-1 px-3 z-20 bg-bg-100 rounded-bl-lg';
+					container.style.height = '2.25rem';
+				} else {
+					container.className = 'toolbox-buttons flex items-center justify-end gap-1';
+				}
+			}
+			if (anchor.referenceNode) {
+				anchor.parent.insertBefore(container, anchor.referenceNode);
+			} else {
 				anchor.parent.appendChild(container);
 			}
-			this._container = container;
-		} else {
-			let container = anchor.parent.querySelector(':scope > .toolbox-buttons');
-			if (!container) {
-				container = document.createElement('div');
-				const isMobileChat = this._currentGroup === 'chat' && isMobileLayout();
-				if (anchor.mode === 'wiggle') {
-					if (isMobileChat) {
-						container.className = 'toolbox-buttons flex items-center gap-1 pointer-events-auto self-end px-3 z-20 bg-bg-100 rounded-bl-lg';
-						container.style.height = '2.25rem';
-						container.style.marginTop = '-4px';
-					} else {
-						container.className = 'toolbox-buttons absolute top-0 z-20 flex items-center gap-1';
-						container.style.height = '3rem';
-					}
-				} else {
-					if (isMobileChat) {
-						container.className = 'toolbox-buttons absolute top-full right-0 flex items-center gap-1 px-3 z-20 bg-bg-100 rounded-bl-lg';
-						container.style.height = '2.25rem';
-					} else {
-						container.className = 'toolbox-buttons flex items-center justify-end gap-1';
-					}
-				}
-				if (anchor.referenceNode) {
-					anchor.parent.insertBefore(container, anchor.referenceNode);
-				} else {
-					anchor.parent.appendChild(container);
-				}
-			}
-			this._container = container;
 		}
+		this._container = container;
 	},
 
 	_syncButtons(group) {
