@@ -11,6 +11,10 @@
 //                                  content blocks
 //   QolBardHost.onHistoryPage(fn)  ReadConversationHistoryResponse.update (scrolling up)
 //   QolBardHost.onSend(fn)         PerformAction's send_message, before it leaves
+//   QolBardHost.guardSend(fn)      fn(ctx) before every send_message and warm_turn (ctx.action says
+//                                  which); a string return refuses it: the host answers the page with
+//                                  a Connect error and nothing is sent. The one thing here that fails
+//                                  closed, so keep guards to refusing (jump-view.js).
 //   QolBardHost.observe(fn)        read-only: every StreamTimeline event the server sends (no heartbeats)
 //
 // A patch is fn(target, ctx), may be async, edits target in place and returns true when it changed
@@ -40,13 +44,13 @@
 	const SERVICE_PATH = '/claudeai-rpc/anthropic.bard.api.v1alpha.ConversationService/';
 	const KILL_SWITCH = 'claude_qol_bard_host_off';
 	const MODE_KEY = 'claude_qol_account_mode'; // read by qolAccountMode() (toolbox-ui.js) too
-	const SNAPSHOT_WAIT_MS = 6000; // see ctx.within; the largest full-load trees measured took 0.7-2.4 s
+	const SNAPSHOT_WAIT_MS = 15000; // see ctx.within; the largest full-load trees measured took 0.7-2.4 s
 	const MODE_TTL_MS = 60 * 60 * 1000; // re-probe hourly: the rollout moves accounts over without warning
 
 	const net = () => globalThis.ClaudeExtNet;
 	const log = createLogger('BardHost');
 
-	const patches = { snapshot: [], liveUpdate: [], historyPage: [], send: [] };
+	const patches = { snapshot: [], liveUpdate: [], historyPage: [], send: [], sendGuard: [] };
 	const observers = [];
 
 	function register(list, fn, { label } = {}) {
@@ -191,9 +195,25 @@
 		} catch (e) {
 			log.warn('could not read the PerformAction request, sent as is:', e);
 		}
+		const ctx = { source: 'action', orgId: orgOf(input, init), conversationId: request?.header?.conversation_id ?? null };
+		const action = request?.send_message ? 'send_message' : request?.warm_turn ? 'warm_turn' : null;
+		if (action) {
+			for (const { fn, label } of patches.sendGuard) {
+				let reason = null;
+				try {
+					reason = fn({ ...ctx, action });
+				} catch (e) {
+					log.error(`${label} threw (${action}, ${ctx.conversationId ?? 'no conversation'}):`, e);
+				}
+				if (typeof reason !== 'string') continue;
+				log(`${label} refused a ${action} in ${ctx.conversationId}: ${reason}`);
+				return new Response(JSON.stringify({ code: 'failed_precondition', message: reason }), {
+					status: 400, headers: { 'content-type': 'application/json' },
+				});
+			}
+		}
 		let finalInit = init;
 		if (request?.send_message) {
-			const ctx = { source: 'action', orgId: orgOf(input, init), conversationId: request.header?.conversation_id ?? null };
 			if (await runPatches(patches.send, request.send_message, ctx)) {
 				try {
 					finalInit = n.withProtoRequestBody(init, n.encodeBard('PerformActionRequest', request));
@@ -211,7 +231,7 @@
 	const needs = {
 		StreamTimeline: () => patches.snapshot.length || patches.liveUpdate.length || observers.length,
 		ReadConversationHistory: () => patches.historyPage.length,
-		PerformAction: () => patches.send.length,
+		PerformAction: () => patches.send.length || patches.sendGuard.length,
 	};
 	const wrappers = { StreamTimeline: wrapTimeline, ReadConversationHistory: wrapHistory, PerformAction: wrapAction };
 
@@ -287,6 +307,7 @@
 		onLiveUpdate: (fn, opts) => register(patches.liveUpdate, fn, opts),
 		onHistoryPage: (fn, opts) => register(patches.historyPage, fn, opts),
 		onSend: (fn, opts) => register(patches.send, fn, opts),
+		guardSend: (fn, opts) => register(patches.sendGuard, fn, opts),
 		observe: (fn, opts) => register(observers, fn, opts),
 		rawFetch: (...args) => rawFetch.apply(window, args),
 		diagnostics,

@@ -377,6 +377,11 @@
 		sessionStorage.removeItem('message_uuid_to_find');
 		sessionStorage.removeItem('highlight_previous_message'); // legacy key, no longer written
 
+		// A jump to another branch: wait until jump-view.js has applied (or dropped) it, or positions
+		// would come from the server's branch. claude.ai can draw its cached copy of the chat before the
+		// (possibly held) snapshot lands, so "the list is there" isn't enough.
+		await qolJumpSettled();
+
 		const revealed = await revealMessageByUuid(messageUuid);
 		if (!revealed) log('Could not reveal message', messageUuid);
 	}

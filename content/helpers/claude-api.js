@@ -130,6 +130,33 @@ async function bustReactQueryCache() {
 }
 bustReactQueryCache();
 
+// The jump view's state, which jump-view.js (MAIN) keeps on <html>. The jumped leaf while
+// conversationId is shown jumped, else null.
+function qolJumpedLeaf(conversationId) {
+	const root = document.documentElement;
+	return conversationId && root.getAttribute('data-qol-jump-view') === conversationId
+		? root.getAttribute('data-qol-jump-leaf')
+		: null;
+}
+
+// Resolves once a jump made by this page load has been applied or dropped (at once without one), or
+// after timeoutMs; it outlasts the host's snapshot wait budget (15 s), which can hold the jump that long.
+function qolJumpSettled(timeoutMs = 20000) {
+	const root = document.documentElement;
+	const pending = () => root.getAttribute('data-qol-jump-state') === 'pending';
+	if (!pending()) return Promise.resolve();
+	return new Promise((resolve) => {
+		const done = () => {
+			observer.disconnect();
+			clearTimeout(timer);
+			resolve();
+		};
+		const observer = new MutationObserver(() => { if (!pending()) done(); });
+		observer.observe(root, { attributes: true, attributeFilter: ['data-qol-jump-state'] });
+		const timer = setTimeout(done, timeoutMs);
+	});
+}
+
 // Shared streaming freshness check.
 // Fetches apiUrl, reads the conversation header (everything before "chat_messages") and
 // compares updated_at *and* current_leaf_message_uuid with cachedEntry.
@@ -233,15 +260,7 @@ class ClaudeConversation {
 	async sendMessageAndWaitForResponse(promptOrMessage, options = {}) {
 		if (!(promptOrMessage instanceof ClaudeMessage)) {
 			const { model = null, parentMessageUuid = ROOT_MESSAGE_UUID } = options;
-			return this._sendAndAwaitAssistant({
-				text: promptOrMessage,
-				parentMessageUuid,
-				model,
-				timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-				locale: accountLocale(),
-				attachments: [],
-				inlineAttachments: [],
-			});
+			return this._sendAndAwaitAssistant({ text: promptOrMessage, parentMessageUuid, model });
 		}
 
 		const msg = promptOrMessage;
@@ -316,7 +335,8 @@ class ClaudeConversation {
 	// the send creates it (the header's conversation id is the one prepareNew chose); send_message
 	// has no name, so the name is set after. `send` is { text, parentMessageUuid, model, timezone,
 	// locale, attachments: [{ id, fileName, fileSize, mediaType }], inlineAttachments: [{ fileName,
-	// fileSize, fileType, extractedContent }] }.
+	// fileSize, fileType, extractedContent }] }; timezone, locale and the attachment lists default to
+	// the browser's zone, the account locale and none.
 	async _sendAndAwaitAssistant(send) {
 		const creating = !this.created;
 		const createParams = this._pendingCreateParams;
@@ -330,10 +350,10 @@ class ClaudeConversation {
 				messageId,
 				assistantMessageId: assistantId,
 				text: send.text,
-				timezone: send.timezone,
-				locale: send.locale,
-				attachments: send.attachments,
-				inlineAttachments: send.inlineAttachments,
+				timezone: send.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+				locale: send.locale ?? accountLocale(),
+				attachments: send.attachments ?? [],
+				inlineAttachments: send.inlineAttachments ?? [],
 			};
 			// Always explicit: left out, the server continues its own current leaf. "" is a new root
 			// (what the root uuid meant to /completion), and also what a conversation's first send uses.
@@ -359,7 +379,7 @@ class ClaudeConversation {
 			// minute means rejected. Polled with a plain fetch, not getData() (no conversation-cache
 			// write per poll; a brand-new conversation can 404 for a moment), backing off so a long
 			// turn doesn't re-download the tree every second.
-			const treeUrl = `/api/organizations/${this.orgId}/chat_conversations/${this.conversationId}?tree=true&rendering_mode=messages&render_all_tools=true&consistency=strong`;
+			const treeUrl = this._treeUrl();
 			const started = Date.now();
 			let accepted = false;
 			let interval = 1500;
@@ -443,6 +463,11 @@ class ClaudeConversation {
 		}
 	}
 
+	// The whole tree, every branch and tool call.
+	_treeUrl() {
+		return `/api/organizations/${this.orgId}/chat_conversations/${this.conversationId}?tree=true&rendering_mode=messages&render_all_tools=true&consistency=strong`;
+	}
+
 	// Lazy load conversation data (always fetches full tree)
 	// Uses IndexedDB cache with streaming freshness check to avoid downloading large payloads.
 	//
@@ -459,7 +484,7 @@ class ClaudeConversation {
 			return this.conversationData;
 		}
 
-		const apiUrl = `/api/organizations/${this.orgId}/chat_conversations/${this.conversationId}?tree=true&rendering_mode=messages&render_all_tools=true&consistency=strong`;
+		const apiUrl = this._treeUrl();
 
 		// Try cache (unless forcing refresh)
 		if (!forceRefresh) {
@@ -517,12 +542,12 @@ class ClaudeConversation {
 		return result.data;
 	}
 
-	// Reconstruct the current trunk from full tree data: walk from current leaf to root
-	_trunkFrom(data) {
+	// Reconstruct a branch from full tree data: walk from a leaf (default: the current one) to root
+	_trunkFrom(data, leafId = data.current_leaf_message_uuid) {
 		const allMessages = data.chat_messages || [];
 		const messageMap = new Map(allMessages.map(msg => [msg.uuid, msg]));
 		const trunk = [];
-		let currentId = data.current_leaf_message_uuid;
+		let currentId = leafId;
 
 		while (currentId && currentId !== ROOT_MESSAGE_UUID) {
 			const msg = messageMap.get(currentId);
@@ -548,11 +573,19 @@ class ClaudeConversation {
 		return this._trunkFrom(data);
 	}
 
+	// The messages from the root down to messageId, whichever branch it's on (the server's current
+	// branch or not, e.g. one viewed with the version arrows or a jump).
+	async getMessagesTo(messageId, forceRefresh = false) {
+		return this._trunkFrom(await this.getData(forceRefresh), messageId);
+	}
+
 	// The current branch as the UI renders it: phantom (forked-in) history first, then the
 	// real messages. Anything that has to line up with what's on screen — locating a row,
-	// counting positions — needs this rather than getMessages().
+	// counting positions — needs this rather than getMessages(). During a jump (jump-view.js) the
+	// page shows the jumped branch, so that's the one built.
 	async getRenderedMessages(forceRefresh = false) {
 		const data = await this.getData(forceRefresh);
+		const leafId = qolJumpedLeaf(this.conversationId) ?? data.current_leaf_message_uuid;
 
 		let phantoms = null;
 		try {
@@ -560,11 +593,11 @@ class ClaudeConversation {
 		} catch (error) {
 			apiLog.error('Failed to load phantom messages:', error);
 		}
-		if (!phantoms?.length) return this._trunkFrom(data);
+		if (!phantoms?.length) return this._trunkFrom(data, leafId);
 
 		// With the ids the page shows them under, so rows and positions line up. `data` stays
 		// phantom-free (it's cached), so getMessages() keeps returning the real branch.
-		return this._trunkFrom(stitchPhantomMessages(data, pagePhantoms(phantoms)));
+		return this._trunkFrom(stitchPhantomMessages(data, pagePhantoms(phantoms)), leafId);
 	}
 
 	// Find longest leaf from a message ID
@@ -1536,15 +1569,6 @@ class ClaudeProject {
 			this.projectData = await response.json();
 		}
 		return this.projectData;
-	}
-
-	// Get syncs
-	async getSyncs() {
-		const response = await fetch(`/api/organizations/${this.orgId}/projects/${this.projectId}/syncs`);
-		if (!response.ok) {
-			throw new Error('Failed to fetch project syncs');
-		}
-		return await response.json();
 	}
 
 	// Get docs (attachments) - always fetch, but cache result
